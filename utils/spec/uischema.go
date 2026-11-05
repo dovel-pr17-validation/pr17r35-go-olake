@@ -1,0 +1,694 @@
+// uischema is used to serve the UI specifications of the jsonschema of all the drivers and destinations
+package spec
+
+import (
+	"fmt"
+)
+
+var uiSchemaMap = map[string]string{
+	"mongodb":  MongoDBUISchema,
+	"postgres": PostgresUISchema,
+	"mysql":    MySQLUISchema,
+	"oracle":   OracleUISchema,
+	"mssql":    MSSQLUISchema,
+	"s3":       S3UISchema,
+	"parquet":  ParquetUISchema,
+	"iceberg":  IcebergUISchema,
+	"db2":      DB2UISchema,
+	"kafka":    KafkaUISchema,
+}
+
+const MongoDBUISchema = `{
+    "ui:sections": [
+      {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "toggle", "fields": ["update_method"]},
+      {"id": "connection", "title": "Connection details", "fields": ["hosts", "database", "authdb", "username", "password", "replica_set", "read_preference", "srv", "chunking_strategy", "use_iam", "ssl", "additional_params"]},
+      {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "backoff_retry_count", "ssh_config"]}
+    ],
+    "ui:grid": [
+        { "hosts": 12, "database": 12 },
+        { "authdb": 12, "username": 12 },
+        { "password": 12, "replica_set": 12 },
+        { "read_preference": 12, "srv": 12 },
+        { "max_threads": 12, "backoff_retry_count": 12 },
+        { "chunking_strategy": 12, "use_iam": 12 },
+        { "ssl": 12, "additional_params": 12 },
+        { "update_method": 12, "ssh_config": 12 }
+    ],
+    "srv": {
+        "ui:widget": "boolean"
+    },
+    "update_method": {
+        "ui:widget": "radio",
+        "ui:options": {
+            "title": false,
+            "description": false
+        },
+        "type": {
+            "ui:widget": "hidden"
+        }
+    },
+    "use_iam": {
+        "ui:widget": "boolean"
+    },
+    "ssl": {
+        "ui:options": {
+            "title": false, "label": false, "description": false
+        },
+        "ui:grid": [
+            { "mode": 24 },
+            { "server_ca": 24 },
+            { "client_cert": 12, "client_key": 12 }
+        ],
+        "mode": {
+            "ui:widget": "select"
+        },
+        "server_ca": {
+            "ui:widget": "textarea",
+            "ui:options": {
+                "rows": 1
+            }
+        },
+        "client_cert": {
+            "ui:widget": "textarea",
+            "ui:options": {
+                "rows": 1
+            }
+        },
+        "client_key": {
+            "ui:widget": "textarea",
+            "ui:options": {
+                "rows": 1
+            }
+        }
+    },
+    "hosts": {
+        "ui:options": {
+            "label": false
+        }
+    },
+    "ssh_config": {
+        "ui:options": {
+            "title": false,
+            "description": false
+        },
+        "ui:grid": [
+            { "host": 12, "port": 12 },
+            { "username": 12, "private_key": 12 },
+            { "passphrase": 12, "password": 12 }
+        ],
+        "private_key": {
+            "ui:widget": "textarea",
+            "ui:options": {
+                "rows": 1
+            }
+        }
+    }
+}`
+
+const PostgresUISchema = `{
+      "ui:sections": [
+        {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "toggle", "fields": ["update_method"]},
+        {"id": "connection", "title": "Connection details", "fields": ["host", "database", "schemas", "username", "password", "port", "jdbc_url_params", "ssl"]},
+        {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "retry_count", "ssh_config"]}
+      ],
+      "ui:grid": [
+        { "host": 12, "database": 12 },
+        { "schemas": 12, "username": 12 },
+        { "password": 12, "port": 12 },
+        { "jdbc_url_params": 12, "ssl": 12 },
+        { "max_threads": 12, "update_method": 12 },
+        { "retry_count": 12, "ssh_config": 12 }
+      ],
+      "schemas": {
+        "ui:options": {
+          "label": false
+        }
+      },
+      "ssl": {
+        "ui:options": {
+          "title": false
+        },
+        "ui:grid": [
+          { "mode": 24 },
+          { "server_ca": 24 },
+          { "client_cert": 12, "client_key": 12 }
+        ],
+        "mode": {
+          "ui:widget": "select"
+        },
+        "server_ca": {
+          "ui:widget": "textarea",
+          "ui:options": {
+            "rows": 1
+          }
+        },
+        "client_cert": {
+          "ui:widget": "textarea",
+          "ui:options": {
+            "rows": 1
+          }
+        },
+        "client_key": {
+          "ui:widget": "textarea",
+          "ui:options": {
+            "rows": 1
+          }
+        }
+      },
+      "update_method": {
+        "ui:widget": "radio",
+        "ui:grid": [{ "replication_slot": 12, "publication": 12 }, { "initial_wait_time": 12 }],
+        "ui:options": {
+          "title": false,
+          "description": false
+        },
+        "type": {
+          "ui:widget": "hidden"
+        },
+        "replication_slot": {
+          "ui:docLink": "https://olake.io/docs/connectors/postgres/setup/generic/#8-create-logical-replication-slot"
+        },
+        "publication": {
+          "ui:docLink": "https://olake.io/docs/connectors/postgres/setup/generic/#7-create-publication"
+        }
+      },
+      "ssh_config": {
+        "ui:options": {
+          "title": false,
+          "description": false
+        },
+        "ui:grid": [
+          { "host": 12, "port": 12 },
+          { "username": 12, "private_key": 12 },
+          { "passphrase": 12, "password": 12 }
+        ],
+        "private_key": {
+          "ui:widget": "textarea",
+          "ui:options": {
+            "rows": 1
+          }
+        }
+      }
+    }`
+
+const MySQLUISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "toggle", "fields": ["update_method"]},
+    {"id": "connection", "title": "Connection details", "fields": ["hosts", "database", "username", "password", "port", "jdbc_url_params", "ssl"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "backoff_retry_count", "ssh_config"]}
+  ],
+  "ui:grid": [
+    { "hosts": 12, "database": 12 },
+    { "username": 12, "password": 12 },
+    { "port": 12, "max_threads": 12 },
+    { "backoff_retry_count": 12, "jdbc_url_params": 12 },
+    { "ssl": 12, "update_method": 12 },
+    { "ssh_config": 12 }
+  ],
+  "ssl": {
+    "ui:options": { "description": false, "label": false },
+    "ui:grid": [
+      { "mode": 24 },
+      { "server_ca": 24 },
+      { "client_cert": 12, "client_key": 12 }
+    ],
+    "mode": {
+      "ui:widget": "select"
+    },
+    "server_ca": {
+      "ui:widget": "textarea",
+      "ui:options": { "rows": 1 }
+    },
+    "client_cert": {
+      "ui:widget": "textarea",
+      "ui:options": { "rows": 1 }
+    },
+    "client_key": {
+      "ui:widget": "textarea",
+      "ui:options": { "rows": 1 }
+    }
+  },
+  "update_method": {
+    "ui:widget": "radio",
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "type": {
+      "ui:widget": "hidden"
+    }
+  },
+  "ssh_config": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "host": 12, "port": 12 },
+      { "username": 12, "private_key": 12 },
+      { "passphrase": 12, "password": 12 }
+    ],
+    "private_key": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    }
+  }
+}`
+
+const MSSQLUISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "toggle", "fields": ["update_method"]},
+    {"id": "connection", "title": "Connection details", "fields": ["host", "database", "username", "password", "port", "jdbc_url_params", "ssl", "manage_capture_instances", "primary_config"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "retry_count", "ssh_config"]}
+  ],
+  "ui:grid": [
+    { "host": 12, "database": 12 },
+    { "username": 12, "password": 12 },
+    { "port": 12, "max_threads": 12 },
+    { "retry_count": 12, "jdbc_url_params": 12 },
+    { "ssl": 12, "manage_capture_instances": 12 },
+    { "primary_config": 24 },
+    { "update_method": 12, "ssh_config": 12 }
+  ],
+  "ssl": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    }
+  },
+  "update_method": {
+    "ui:widget": "radio",
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "type": {
+      "ui:widget": "hidden"
+    }
+  },
+  "manage_capture_instances": {
+    "ui:widget": "boolean"
+  },
+  "primary_config": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "host": 12, "port": 12 },
+      { "username": 12, "password": 12 }
+    ],
+    "password": {
+      "ui:widget": "password"
+    }
+  },
+  "ssh_config": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "host": 12, "port": 12 },
+      { "username": 12, "private_key": 12 },
+      { "passphrase": 12, "password": 12 }
+    ],
+    "private_key": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    }
+  }
+}`
+
+const OracleUISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "not_supported"},
+    {"id": "connection", "title": "Connection details", "fields": ["host", "connection_type", "username", "sid", "service_name", "password", "port", "jdbc_url_params", "ssl"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "backoff_retry_count", "ssh_config"]}
+  ],
+  "ui:grid": [
+    { "host": 12, "connection_type": 12 },
+    { "username": 12, "sid": 12, "service_name": 12 },
+    { "password": 12, "port": 12 },
+    { "jdbc_url_params": 12, "ssl": 12 },
+    { "max_threads": 12, "backoff_retry_count": 12 },
+    { "ssh_config": 12 }
+  ],
+  "ssl": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    }
+  },
+  "connection_type": {
+    "ui:grid": [
+      { "sid": 12, "service_name": 12 }
+    ],
+     "ui:enumNames": [
+      "SID",
+      "Service Name"
+    ]
+  },
+  "ssh_config": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "host": 12, "port": 12 },
+      { "username": 12, "private_key": 12 },
+      { "passphrase": 12, "password": 12 }
+    ],
+    "private_key": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    }
+  }
+}`
+
+const S3UISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "not_supported"},
+    {"id": "connection", "title": "Connection details", "fields": ["bucket_name", "region", "access_key_id", "secret_access_key", "path_prefix", "endpoint", "file_pattern", "compression", "file_format", "csv", "parquet", "json", "xml"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["retry_count", "max_threads"]}
+  ],
+  "ui:grid": [
+    { "bucket_name": 12, "region": 12 },
+    { "access_key_id": 12, "secret_access_key": 12 },
+    { "path_prefix": 12, "endpoint": 12 },
+    { "file_pattern": 12, "compression": 12 },
+    { "retry_count": 12, "max_threads": 12 },
+    { "file_format": 12},
+    { "csv": 12, "parquet": 12, "json": 12, "xml": 12 }
+  ],
+  "file_format": {
+    "ui:enumNames": [
+      "CSV",
+      "JSON",
+      "Parquet",
+      "XML"
+    ]
+  },
+  "csv": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "delimiter": 12, "has_header": 12 },
+      { "skip_rows": 12, "quote_character": 12 }
+    ],
+    "has_header": {
+      "ui:widget": "boolean"
+    }
+  },
+  "json": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "line_delimited": 12 }
+    ],
+    "line_delimited": {
+      "ui:widget": "boolean"
+    }
+  },
+  "parquet": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "streaming_enabled": 12 }
+    ],
+    "streaming_enabled": {
+      "ui:widget": "boolean"
+    }
+  },
+  "xml": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "row_identifier": 12 }
+    ]
+  }
+}`
+
+const KafkaUISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "not_supported"},
+    {"id": "connection", "title": "Connection details", "fields": ["bootstrap_servers", "consumer_group_id", "topic_pattern", "protocol", "use_schema_registry", "schema_registry"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["threads_equal_total_partitions", "max_threads", "backoff_retry_count"]}
+  ],
+  "ui:grid": [
+    { "bootstrap_servers": 24 },
+    { "consumer_group_id": 12, "topic_pattern": 12 },
+    { "threads_equal_total_partitions": 12, "max_threads": 12 },
+    { "backoff_retry_count": 12, "protocol": 12 },
+    { "use_schema_registry": 24 },
+    { "schema_registry": 24 }
+  ],
+  "protocol": {
+    "ui:grid": [
+      { "sasl_mechanism": 12, "sasl_jaas_config": 12 },
+      { "tls_skip_verify": 24 },
+      { "ssl": 24 }
+    ],
+    "sasl_jaas_config": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    },
+    "tls_skip_verify": {
+      "ui:widget": "boolean"
+    },
+    "ssl": {
+      "ui:options": {
+        "title": false,
+        "description": false
+      },
+      "ui:grid": [
+        { "server_ca": 12, "client_cert": 12 },
+        { "client_key": 12 }
+      ],
+      "server_ca": {
+        "ui:widget": "textarea",
+        "ui:options": {
+          "rows": 1
+        }
+      },
+      "client_cert": {
+        "ui:widget": "textarea",
+        "ui:options": {
+          "rows": 1
+        }
+      },
+      "client_key": {
+        "ui:widget": "textarea",
+        "ui:options": {
+          "rows": 1
+        }
+      }
+    },
+    "ui:options": {
+      "title": false
+    }
+  },
+  "use_schema_registry": {
+    "ui:widget": "boolean"
+  },
+  "schema_registry": {
+    "ui:options": {
+      "title": false
+    },
+    "ui:grid": [
+      { "endpoint": 12, "auth_type": 12 },
+      { "username": 12, "password": 12 },
+      { "bearer_token": 24 }
+    ],
+    "password": {
+      "ui:widget": "password"
+    },
+    "bearer_token": {
+      "ui:widget": "password"
+    }
+  },
+  "threads_equal_total_partitions": {
+    "ui:widget": "boolean"
+  }
+}`
+
+const ParquetUISchema = `{
+  "type": {
+    "ui:widget": "hidden"
+  },
+  "writer": {
+    "ui:grid": [
+      { "storage_type": 12, "azure_auth_type": 12 },
+      { "s3_bucket": 12, "s3_region": 12 },
+      { "s3_endpoint": 12, "s3_access_key": 12 },
+      { "s3_secret_key": 12, "s3_path": 12 },
+      { "azure_storage_account_name": 12, "azure_container_name": 12 },
+      { "azure_path": 12, "azure_endpoint": 12 },
+      { "azure_storage_account_key": 12, "azure_sas_token": 12 },
+      { "azure_connection_string": 12, "azure_client_id": 12 },
+      { "max_file_size_mb": 12 }
+    ],
+    "azure_auth_type": {
+      "ui:enumNames": [
+        "Shared Key",
+        "SAS Token",
+        "Connection String",
+        "Managed Identity/Workload Identity"
+      ]
+    },
+    "azure_storage_account_key": {
+      "ui:widget": "password"
+    },
+    "azure_sas_token": {
+      "ui:widget": "password"
+    },
+    "azure_connection_string": {
+      "ui:widget": "password",
+      "ui:help": "This string needs AccountName or BlobEndpoint, and AccountKey or SharedAccessSignature. UseDevelopmentStorage=true is not supported."
+    },
+    "azure_client_id": {
+      "ui:help": "Overrides the AKS ServiceAccount annotation and the VM identity. It does not fall back."
+    },
+    "ui:options": {
+      "label": false
+    }
+  }
+}`
+
+const IcebergUISchema = `{
+  "type": {
+    "ui:widget": "hidden"
+  },
+  "writer": {
+    "ui:grid": [
+      { "catalog_type": 12, "rest_auth_type": 12 },
+      { "catalog_name": 12, "rest_catalog_url": 12 }, 
+      { "jdbc_url": 24},
+      { "jdbc_username": 12, "jdbc_password": 12},
+      { "hive_uri": 12, "hive_clients": 12 },
+      { "hive_sasl_enabled": 24 }, 
+      { "iceberg_s3_path": 12, "s3_endpoint": 12},
+      { "credential": 12, "oauth2_uri": 12 },
+      { "scope": 12, "token": 12 },
+      { "no_identifier_fields": 24 },
+      { "aws_access_key": 12, "aws_secret_key": 12 },
+      { "aws_region": 12, "s3_path_style": 12 },
+      { "s3_use_ssl": 12 },
+      { "rest_signing_name": 12, "rest_signing_region": 12 },
+      { "rest_signing_v_4": 24 },
+      { "gcp_service_account_json": 12, "gcp_auth_scopes": 12 },
+      { "gcp_project_id": 12 },
+      { "glue_additional_config": 24 },
+      { "glue_catalog_id": 12, "glue_endpoint": 12},
+	    { "glue_access_key": 12, "glue_secret_key": 12 }, 
+      { "glue_region": 12 },
+      { "arrow_writes": 24 }
+    ],
+    "gcp_service_account_json": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    },
+    "no_identifier_fields": {
+      "ui:widget": "boolean"
+    },
+    "rest_signing_v_4": {
+      "ui:widget": "boolean"
+    },
+    "s3_use_ssl": {
+      "ui:widget": "boolean"
+    },
+    "hive_sasl_enabled": {
+      "ui:widget": "boolean"
+    },
+    "s3_path_style": {
+      "ui:widget": "boolean"
+    },
+    "arrow_writes": {
+      "ui:widget": "boolean"
+    },
+    "glue_additional_config": {
+      "ui:widget": "boolean"
+    },
+    "catalog_type": {
+      "ui:enumNames": [
+        "AWS Glue",
+        "JDBC",
+        "Hive",
+        "Generic REST",
+        "Lakekeeper",
+        "Nessie",
+        "S3 Tables",
+        "Unity",
+        "Polaris",
+        "Big Lake",
+        "Horizon"
+      ]
+    },
+    "ui:options": {
+      "label": false
+    }
+  }
+}`
+
+const DB2UISchema = `{
+  "ui:sections": [
+    {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "not_supported"},
+    {"id": "connection", "title": "Connection details", "fields": ["host", "port", "database", "username", "password", "jdbc_url_params", "ssl"]},
+    {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "retry_count", "ssh_config"]}
+  ],
+  "ui:grid": [
+    { "host": 12, "port": 12 },
+    { "database": 12, "max_threads": 12 },
+    { "username": 12, "password": 12 },
+    { "jdbc_url_params": 12, "retry_count": 12 },
+    { "ssl": 12 }, { "ssh_config": 12 }
+  ],
+  "ssl": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    }
+  },
+  "ssh_config": {
+    "ui:options": {
+      "title": false,
+      "description": false
+    },
+    "ui:grid": [
+      { "host": 12, "port": 12 },
+      { "username": 12, "private_key": 12 },
+      { "passphrase": 12, "password": 12 }
+    ],
+    "private_key": {
+      "ui:widget": "textarea",
+      "ui:options": {
+        "rows": 1
+      }
+    }
+  }
+}`
+
+func LoadUISchema(schemaType string) (string, error) {
+	jsonStr, ok := uiSchemaMap[schemaType]
+	if !ok {
+		return "", fmt.Errorf("schema not found")
+	}
+	return jsonStr, nil
+}

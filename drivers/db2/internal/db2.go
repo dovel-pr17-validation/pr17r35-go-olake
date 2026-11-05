@@ -1,0 +1,249 @@
+package driver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/pkg/jdbc"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/jmoiron/sqlx"
+	"golang.org/x/crypto/ssh"
+)
+
+type DB2 struct {
+	client      *sqlx.DB
+	config      *Config
+	state       *types.State
+	sshClient   *ssh.Client
+	sshListener net.Listener
+}
+
+func (d *DB2) CDCSupported() bool {
+	return false // CDC is not supported for db2 yet
+}
+
+func (d *DB2) Setup(ctx context.Context) error {
+	if err := d.config.Validate(); err != nil {
+		return err
+	}
+
+	if d.config.SSHConfig != nil && d.config.SSHConfig.Host != "" {
+		logger.Info("Found SSH Configuration")
+		var err error
+		d.sshClient, err = d.config.SSHConfig.SetupSSHConnection()
+		if err != nil {
+			return fmt.Errorf("failed to setup SSH connection: %w", err)
+		}
+	}
+
+	var dsn string
+	if d.sshClient != nil {
+		logger.Info("Connecting to DB2 via SSH tunnel")
+
+		listener, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			return fmt.Errorf("failed to create local listener for SSH tunnel: %w", err)
+		}
+		d.sshListener = listener
+
+		remoteAddr := fmt.Sprintf("%s:%d", d.config.Host, d.config.Port)
+		go d.forwardConnections(listener, remoteAddr)
+
+		localAddr := listener.Addr().(*net.TCPAddr)
+		dsn = d.config.BuildTunnelDSN(localAddr.Port)
+	} else {
+		dsn = d.config.BuildDSN()
+	}
+
+	client, err := sqlx.Open("go_ibm_db", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to open db2 connection: %w", err)
+	}
+
+	client.SetMaxOpenConns(d.config.MaxThreads)
+
+	// Verify connection
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.PingContext(ctx); err != nil {
+		return fmt.Errorf("failed to ping db2: %w", err)
+	}
+
+	d.client = client
+	return nil
+}
+
+func (d *DB2) StateType() types.StateType {
+	return types.StreamType
+}
+
+func (d *DB2) SetupState(state *types.State) {
+	d.state = state
+}
+
+func (d *DB2) GetConfigRef() abstract.Config {
+	d.config = &Config{}
+	return d.config
+}
+
+func (d *DB2) Spec() any {
+	return Config{}
+}
+
+func (d *DB2) CloseConnection() {
+	if d.client != nil {
+		if err := d.client.Close(); err != nil {
+			logger.Error("failed to close db2 connection: %s", err)
+		}
+	}
+
+	if d.sshListener != nil {
+		if err := d.sshListener.Close(); err != nil {
+			logger.Errorf("failed to close SSH tunnel listener: %s", err)
+		}
+	}
+
+	if d.sshClient != nil {
+		if err := d.sshClient.Close(); err != nil {
+			logger.Errorf("failed to close SSH client: %s", err)
+		}
+	}
+}
+
+func (d *DB2) forwardConnections(listener net.Listener, remoteAddr string) {
+	for {
+		localConn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+
+		remoteConn, err := d.sshClient.Dial("tcp", remoteAddr)
+		if err != nil {
+			logger.Warnf("failed to dial DB2 target %s through SSH tunnel: %s", remoteAddr, err)
+			localConn.Close()
+			continue
+		}
+
+		go func() {
+			defer localConn.Close()
+			defer remoteConn.Close()
+
+			// The second copy always exits with net.ErrClosed once teardown closes both conns,
+			// so only unexpected copy failures are logged.
+			done := make(chan struct{}, 2)
+			tunnelCopy := func(dst, src net.Conn, way string) {
+				if _, err := io.Copy(dst, src); err != nil && !errors.Is(err, net.ErrClosed) {
+					logger.Warnf("ssh tunnel %s copy failed: %s", way, err)
+				}
+				done <- struct{}{}
+			}
+			go tunnelCopy(localConn, remoteConn, "remote->local")
+			go tunnelCopy(remoteConn, localConn, "local->remote")
+			<-done
+		}()
+	}
+}
+
+func (d *DB2) Type() string {
+	return string(constants.DB2)
+}
+
+func (d *DB2) MaxConnections() int {
+	return d.config.MaxThreads
+}
+
+func (d *DB2) MaxRetries() int {
+	return d.config.RetryCount
+}
+
+func (d *DB2) GetStreamNames(ctx context.Context) ([]types.StreamID, error) {
+	logger.Infof("Starting discover for DB2 database %s", d.config.Database)
+
+	rows, err := d.client.QueryContext(ctx, jdbc.DB2DiscoveryQuery())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tables: %w", err)
+	}
+	defer rows.Close()
+
+	var streamNames []types.StreamID
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			return nil, fmt.Errorf("failed to scan table row: %w", err)
+		}
+		streamNames = append(streamNames, types.StreamID{Namespace: schema, Name: name})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over table rows: %w", err)
+	}
+
+	return streamNames, nil
+}
+
+func (d *DB2) ProduceSchema(ctx context.Context, streamName types.StreamID) (*types.Stream, error) {
+	populateStreams := func(ctx context.Context, streamName types.StreamID) (*types.Stream, error) {
+		logger.Infof("producing type schema for stream [%s]", streamName)
+
+		schemaName, tableName := streamName.Namespace, streamName.Name
+		stream := types.NewStream(tableName, schemaName, &d.config.Database)
+
+		rows, err := d.client.QueryContext(ctx, jdbc.DB2TableSchemaAndPrimaryKeysQuery(), schemaName, tableName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query column metadata: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var (
+				columnName string
+				dataType   string
+				isNullable string
+				pkColumn   *string
+			)
+
+			if err := rows.Scan(&columnName, &dataType, &isNullable, &pkColumn); err != nil {
+				return nil, fmt.Errorf("failed to scan column: %w", err)
+			}
+
+			stream.WithCursorField(columnName)
+			var datatype types.DataType
+
+			if val, found := db2TypeToDataTypes[strings.ToLower(dataType)]; found {
+				datatype = val
+			} else {
+				logger.Debugf("unsupported DB2 type '%s' for column '%s.%s', defaulting to String", dataType, streamName, columnName)
+				datatype = types.String
+			}
+			stream.UpsertField(columnName, datatype, isNullable == "Y", false)
+
+			if pkColumn != nil {
+				stream.WithPrimaryKey(columnName)
+			}
+		}
+		return stream, rows.Err()
+	}
+
+	stream, err := populateStreams(ctx, streamName)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("failed to produce schema context deadline exceeded: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("failed to process table[%s]: %w", streamName, err)
+	}
+
+	stream.WithSyncMode(types.FULLREFRESH, types.INCREMENTAL)
+	if d.CDCSupported() {
+		stream.WithSyncMode(types.CDC, types.STRICTCDC)
+	}
+
+	return stream, nil
+}

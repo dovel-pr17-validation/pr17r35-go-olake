@@ -1,0 +1,566 @@
+package testutils
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/datazip-inc/olake/tests/testutils/constants"
+)
+
+const (
+	SyncTimeout = 10 * time.Minute
+
+	KeepTestDataEnvVar = "OLAKE_TEST_KEEP_DATA"
+)
+
+// ExecuteQueryFn drives the driver's source: the suites call it with an operation name, and the
+// driver's own implementation knows what that means for its source.
+type ExecuteQueryFn func(ctx context.Context, t *testing.T, cfg *TestConfig, operation string)
+
+// TestConfig holds the configuration for a single test suite run per driver
+type TestConfig struct {
+	Driver     string
+	DataFormat string
+
+	// Suite is the unique identifier for the test suite running.
+	// This is used to isolate test data and resources for concurrent test runs.
+	Suite string
+
+	// ImagePlatform overrides the platform the driver image runs under, for images that exist
+	// only for amd64 and run emulated elsewhere.
+	ImagePlatform string
+
+	// DriverVersion identifies the driver revision to run the test against.
+	// It can be a released version or a commit ID. Defaults to the local codebase.
+	DriverVersion string
+
+	// OlakeRootPath is the repo the tests run from, the directory `make docker.<driver>.build`
+	// runs in and the committed fixtures are read from. Resolved by setupWorkingDir.
+	OlakeRootPath string
+
+	// TestWorkingDir is this config's private /tmp working dir, the folder where we run olake
+	// commands and expect the generated files. Every file the suite reads or writes lives in it and
+	// is addressed by name through GetFilePath, so there is no path to keep a field for.
+	TestWorkingDir string
+
+	// SeedExcludedColumns names the columns this suite must leave out of its seed data entirely --
+	// columns the binary under test cannot sync at any price. The backward-compatibility runner
+	// fills it in per baseline from its rules; every other suite leaves it empty, so a driver's
+	// ExecuteQuery reads it and seeds everything by default.
+	SeedExcludedColumns []string `json:"-"`
+
+	// SourceBaseConfig is the working copy of source.json, parsed: the suite's own credentials,
+	// database and prefixes, after isolateSuiteConfigs renamed what it isolates. ExecuteQuery connects with
+	// it, so the harness and olake always drive the same source.
+	SourceBaseConfig SourceConfig `json:"-"`
+
+	// DestinationDB is the namespace this suite's syncs write to, read out of the catalog once
+	// IsolateDestinationDB has suffixed it with the suite.
+	DestinationDB string
+
+	SkipSchemaEvolution bool
+
+	// StreamsV1 runs olake against the deprecated streams.json (--catalog) instead of
+	// available_streams.json + selected_streams.json. Remove with streams v1 support.
+	StreamsV1 bool
+
+	// Driver shape: the same for every suite this driver runs, so it is declared once here
+	// rather than per test.
+	Namespace       string
+	ExecuteQuery    ExecuteQueryFn `json:"-"`
+	CursorField     string
+	PartitionRegex  string
+	FilterConfig    string
+	ColumnToExclude string
+	PrimaryKey      string
+}
+
+type TestConfigOption func(*TestConfig)
+
+// NewTestConfig builds a driver's config from what a suite cannot derive for itself: the source it
+// reads and the namespace it drives. dataFormat names the driver's testdata subdirectory, for the
+// drivers that have one.
+func NewTestConfig(t *testing.T, driver constants.DriverType, namespace string, executeQuery ExecuteQueryFn, opts ...TestConfigOption) (*TestConfig, error) {
+	t.Helper()
+	cfg := &TestConfig{
+		Driver:       string(driver),
+		Namespace:    namespace,
+		ExecuteQuery: executeQuery,
+	}
+
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	err := cfg.setup(t)
+	if err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func WithDriverVersion(version string) TestConfigOption {
+	return func(c *TestConfig) {
+		c.DriverVersion = version
+	}
+}
+
+func WithImagePlatform(platform string) TestConfigOption {
+	return func(c *TestConfig) {
+		c.ImagePlatform = platform
+	}
+}
+
+func WithDataFormat(dataFormat string) TestConfigOption {
+	return func(c *TestConfig) {
+		c.DataFormat = dataFormat
+	}
+}
+
+// WithStreamsV1 runs the suite against streams.json (--catalog). Remove with streams v1 support.
+func WithStreamsV1() TestConfigOption {
+	return func(c *TestConfig) {
+		c.StreamsV1 = true
+	}
+}
+
+func (c *TestConfig) generateSuiteName(t *testing.T) {
+	t.Helper()
+	nonSuiteChars := regexp.MustCompile(`[^a-z0-9]+`)
+	suite := strings.ToLower(t.Name())
+	suite = strings.TrimPrefix(suite, "test")
+	suite = strings.TrimPrefix(suite, string(c.Driver))
+	c.Suite = strings.Trim(nonSuiteChars.ReplaceAllString(suite, "_"), "_")
+}
+
+// setup initializes the derived fields of the TestConfig and does the steup for configuring the test isolation like isolated configs
+func (c *TestConfig) setup(t *testing.T) error {
+	t.Helper()
+
+	c.generateSuiteName(t)
+	c.addTimingLogsMiddleware()
+
+	if err := c.setupWorkingDir(t); err != nil {
+		return err
+	}
+	if err := c.pullOrBuildDriverImage(t); err != nil {
+		return err
+	}
+	if err := c.isolateSuiteConfigs(); err != nil {
+		return err
+	}
+
+	sourceConfig, err := ReadSourceConfig(c.GetFilePath("source.json"))
+	if err != nil {
+		return fmt.Errorf("failed to read the source config of driver %q suite %q: %s", c.Driver, c.Suite, err)
+	}
+	c.SourceBaseConfig = sourceConfig
+	t.Logf("test config: %s", c)
+
+	return nil
+}
+
+func (c *TestConfig) String() string {
+	config, _ := json.MarshalIndent(c, "", "  ")
+	return string(config)
+}
+
+// pullOrBuildDriverImage just sets the driver image in case  builds the driver image against current codebase
+func (c *TestConfig) pullOrBuildDriverImage(t *testing.T) (err error) {
+	if c.DriverVersion == "" {
+		c.DriverVersion = GetCurrentDriverVersion()
+	}
+	return c.resolveImage(t)
+}
+
+// resolveImage turns a version string into an image ref present on the local daemon:
+//
+//	"local"                            -> built from current code
+//	"latest", "v0.6.5"                 -> olakego/source-<driver>:<spec>, pulled
+//	"9f3c1ab", "sha:9f3c1ab"           -> built from a detached worktree at that commit
+func (c *TestConfig) resolveImage(t *testing.T) error {
+	if c.DriverVersion == defaultDriverVersion {
+		return buildDriverImage(t, c)
+	}
+	// A commit id is abbreviated on the way in, and that short form becomes the image tag.
+	if commitID, ok := ResolveToCommit(c.OlakeRootPath, c.DriverVersion); ok {
+		c.DriverVersion = commitID
+		return buildImageFromCommit(t, c, commitID)
+	}
+
+	return ensureImagePresent(t, c.GetDriverImage(), c.ImagePlatform)
+}
+
+func (c *TestConfig) addTimingLogsMiddleware() {
+	executeFunc := c.ExecuteQuery
+	c.ExecuteQuery = func(ctx context.Context, t *testing.T, cfg *TestConfig, operation string) {
+		defer TrackPhaseTiming(t, c.Driver, fmt.Sprintf("query %q", operation))()
+		executeFunc(ctx, t, cfg, operation)
+	}
+}
+
+// SetExecuteQuery replaces the config's query function, timed like the one NewTestConfig was
+// given, for a suite that can only build its function once the config exists.
+func (c *TestConfig) SetExecuteQuery(executeQuery ExecuteQueryFn) {
+	c.ExecuteQuery = executeQuery
+	c.addTimingLogsMiddleware()
+}
+
+// UniqueID identifies this run among every suite that can be running beside it: the driver and the
+// suite itself. Everything a suite must not share is named after it.
+func (c *TestConfig) UniqueID() string {
+	return Combine(c.withSuite(c.Driver))
+}
+
+func (c *TestConfig) withSuite(base string) string {
+	return Combine(base, c.Suite)
+}
+
+// TestTableName is the source table a suite drives. The suite suffix is what keeps concurrent
+// suites off each other's table -- without it they race the same DROP/CREATE.
+func (c *TestConfig) GetTableName() string {
+	return Combine("test_table_olake", c.Suite)
+}
+
+func (c *TestConfig) GetDriverImage() string {
+	return fmt.Sprintf("olakego/source-%s:%s", c.Driver, c.DriverVersion)
+}
+
+// GetFilePath addresses a file in the suite's working directory by name -- the configs, the
+// catalog, state and stats all live there, and the container reads them under the same names.
+func (c *TestConfig) GetFilePath(fileName string) string {
+	return filepath.Join(c.TestWorkingDir, fileName)
+}
+
+// GetFixturePath addresses a committed fixture in the driver's testdata directory, for the one
+// thing a run must outlive its working directory: the benchmark history the perf suite appends to.
+// Everything else a suite reads is the working copy setupWorkingDir made, via GetFilePath.
+func (c *TestConfig) GetFixturePath(fileName string, dataFormat ...string) string {
+	return filepath.Join(c.OlakeRootPath, "tests", c.Driver, "testdata", filepath.Join(dataFormat...), fileName)
+}
+
+// setupWorkingDir gives the suite a private working directory holding its own copy of every config
+// the driver container reads, so the repo fixtures stay read-only and concurrent suites never share
+// a writable file. The shared fixtures land first and the driver's own overwrite them by name, so a
+// driver overrides a common config just by committing a file of the same name.
+func (c *TestConfig) setupWorkingDir(t *testing.T) (err error) {
+	c.TestWorkingDir = t.TempDir()
+
+	c.OlakeRootPath, err = RepoRoot()
+	if err != nil {
+		return fmt.Errorf("failed to determine the repo root; the tests run from a git checkout: %s", err)
+	}
+
+	// static committed files(called fixtures) are copied into the working dir.
+	// It contains the source and destination configs, the catalog and the initial state
+	commonFixturesDir := filepath.Join(c.OlakeRootPath, "tests/testdata")
+	if err := CopyDirFiles(commonFixturesDir, c.TestWorkingDir); err != nil {
+		return fmt.Errorf("failed to copy the fixtures of %s into %s: %s", commonFixturesDir, c.TestWorkingDir, err)
+	}
+	entries, err := os.ReadDir(commonFixturesDir)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", commonFixturesDir, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		subdir := filepath.Join(commonFixturesDir, entry.Name())
+		if err := CopyDirFiles(subdir, c.TestWorkingDir); err != nil {
+			return fmt.Errorf("failed to copy the fixtures of %s into %s: %s", subdir, c.TestWorkingDir, err)
+		}
+	}
+	driverFixturesDir := filepath.Join(c.OlakeRootPath, "tests", c.Driver, "testdata", c.DataFormat)
+	if err := CopyDirFiles(driverFixturesDir, c.TestWorkingDir); err != nil {
+		return fmt.Errorf("failed to copy the fixtures of %s into %s: %s", driverFixturesDir, c.TestWorkingDir, err)
+	}
+	return nil
+}
+
+// isolateSuiteConfigs derives every config the driver container reads from its committed base, so the base
+// files stay untouched, and retargets the copies at the names this suite owns.
+func (c *TestConfig) isolateSuiteConfigs() error {
+	enableArrowWrites := func(destinationConf map[string]interface{}) error {
+		writer, ok := destinationConf["writer"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("no writer object in iceberg_s3_destination.json")
+		}
+		writer["arrow_writes"] = true
+
+		return nil
+	}
+
+	err := CopyJSONWithEdit(c.GetFilePath("iceberg_s3_destination.json"), c.GetFilePath("iceberg_s3_destination_arrow.json"), enableArrowWrites)
+	if err != nil {
+		return fmt.Errorf("failed to derive the arrow destination config of driver %q suite %q: %s", c.Driver, c.Suite, err)
+	}
+
+	if err := c.getOrRenderConfig("source.template.json", "source.json"); err != nil {
+		return fmt.Errorf("failed to isolate the source config of driver %q for suite %q: %s", c.Driver, c.Suite, err)
+	}
+
+	if _, err := c.RenderCatalog(""); err != nil {
+		return fmt.Errorf("failed to retarget the catalog of driver %q at suite %q table %s: %s", c.Driver, c.Suite, c.GetTableName(), err)
+	}
+	return nil
+}
+
+// getOrRenderConfig checks if we need to get the configFile provided by the caller or render it from committed template.
+// NOTE: Currently all the tests use templates except PerformanceTests which provides the configs directly.
+func (c *TestConfig) getOrRenderConfig(template, configPath string) error {
+	_, err := os.Stat(c.GetFilePath(configPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return c.RenderConfig(template, configPath)
+	} else if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// RenderConfig expands the placeholders of the committed template and writes the result to outputFile
+func (c *TestConfig) RenderConfig(template, outputFile string) error {
+	raw, err := os.ReadFile(c.GetFilePath(template))
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", template, err)
+	}
+	expanded, err := c.expandPlaceholders(raw)
+	if err != nil {
+		return fmt.Errorf("failed to expand %s: %s", template, err)
+	}
+	return WriteHostFile(c.GetFilePath(outputFile), expanded)
+}
+
+// placeholder matches the ${name} form alone: the source configs carry credentials, and a secret
+// holding a bare $ has to survive rendering untouched.
+var placeholder = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandPlaceholders substitutes the ${suite} a committed config spells its per-suite names with --
+// ${SUITE} for the drivers whose identifiers are uppercase -- so the file reads as what it renders.
+func (c *TestConfig) expandPlaceholders(raw []byte) ([]byte, error) {
+	var unknown []string
+	expanded := placeholder.ReplaceAllFunc(raw, func(match []byte) []byte {
+		switch name := string(placeholder.FindSubmatch(match)[1]); name {
+		case "suite":
+			return []byte(c.Suite)
+		case "SUITE":
+			return []byte(strings.ToUpper(c.Suite))
+		default:
+			unknown = append(unknown, name)
+			return match
+		}
+	})
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("undefined placeholder(s) %s: a config can only carry ${suite} and ${SUITE}", strings.Join(unknown, ", "))
+	}
+	return expanded, nil
+}
+
+// The helpers below edit the driver's config/catalog files on the host; the container sees the
+// changes through the /testdata mount.
+
+// EditJSONFile reads path, applies edit to the decoded document, and writes it back.
+func EditJSONFile(path string, edit func(doc map[string]interface{}) error) error {
+	doc, err := readJSONDoc(path)
+	if err != nil {
+		return err
+	}
+	if err := edit(doc); err != nil {
+		return err
+	}
+	return writeJSONDoc(path, doc)
+}
+
+// readJSONDoc reads and decodes the JSON object at path.
+func readJSONDoc(path string) (map[string]interface{}, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %s", path, err)
+	}
+	doc, err := ParseJSONDoc(raw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %s", path, err)
+	}
+	return doc, nil
+}
+
+// writeJSONDoc encodes doc as indented JSON and writes it to path.
+func writeJSONDoc(path string, doc map[string]interface{}) error {
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal %s: %s", path, err)
+	}
+	return WriteHostFile(path, out)
+}
+
+// WriteHostFile writes to the shared /testdata mount, unlinking first. DockerRunArgs runs the
+// container as the test user, but as root when it cannot look the user up. On Linux the test user
+// can replace a root-owned file a previous run left behind, but cannot truncate it.
+func WriteHostFile(path string, data []byte) error {
+	_ = os.Remove(path)
+	return os.WriteFile(path, data, 0600)
+}
+
+// NormalizeStreamName uppercases the stream name for drivers whose catalogs store
+// uppercase identifiers (e.g. Oracle).
+func NormalizeStreamName(driver, streamName string) string {
+	return Ternary(slices.Contains(constants.UppercaseStreamDrivers, constants.DriverType(driver)), strings.ToUpper(streamName), streamName).(string)
+}
+
+// IsolateDestinationDB suffixes every stream's destination_database with the suite and records it as
+// DestinationDB: the driver writes a baked destination_database verbatim, ignoring the prefix flag.
+func (c *TestConfig) IsolateDestinationDB() error {
+	return c.Catalog().Edit(func(doc map[string]interface{}) error {
+		entries, _ := doc["streams"].([]interface{})
+		for _, entry := range entries {
+			wrapper, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			stream, ok := wrapper["stream"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			destinationDB, ok := stream["destination_database"].(string)
+			if !ok || destinationDB == "" {
+				continue
+			}
+			destinationDB = c.withSuite(destinationDB)
+			stream["destination_database"] = destinationDB
+			c.DestinationDB = strings.ReplaceAll(destinationDB, ":", "_")
+		}
+		return nil
+	})
+}
+
+// UpdateSelectedStreams rewrites selected_streams so only the given streams stay selected, with
+// normalization enabled and the partition regex, filter config and excluded columns applied.
+func UpdateSelectedStreams(config *TestConfig, namespace, partitionRegex, filterConfig string, streams []string, excludedColumns []string) error {
+	if len(streams) == 0 {
+		return nil
+	}
+	selectedNames := make(map[string]bool, len(streams))
+	for _, s := range streams {
+		selectedNames[NormalizeStreamName(config.Driver, s)] = true
+	}
+
+	var filter interface{} = map[string]interface{}{}
+	if filterConfig != "" {
+		if err := json.Unmarshal([]byte(filterConfig), &filter); err != nil {
+			return fmt.Errorf("failed to parse filter config: %s", err)
+		}
+	}
+
+	excluded := make(map[string]bool, len(excludedColumns))
+	for _, column := range excludedColumns {
+		if column != "" {
+			excluded[column] = true
+		}
+	}
+
+	return config.Catalog().Edit(func(doc map[string]interface{}) error {
+		selected, _ := doc["selected_streams"].(map[string]interface{})
+		nsStreams, _ := selected[namespace].([]interface{})
+		kept := make([]interface{}, 0, len(nsStreams))
+		for _, raw := range nsStreams {
+			stream, ok := raw.(map[string]interface{})
+			if !ok || !selectedNames[fmt.Sprint(stream["stream_name"])] {
+				continue
+			}
+			streamName := fmt.Sprint(stream["stream_name"])
+			delete(selectedNames, streamName)
+			stream["normalization"] = true
+			stream["partition_regex"] = partitionRegex
+			stream["filter_config"] = filter
+			if len(excluded) > 0 {
+				excludeColumns(doc, namespace, streamName, stream, excluded)
+			}
+			kept = append(kept, stream)
+		}
+		if len(selectedNames) > 0 {
+			return fmt.Errorf("streams %v not found in namespace %q", slices.Sorted(maps.Keys(selectedNames)), namespace)
+		}
+		doc["selected_streams"] = map[string]interface{}{namespace: kept}
+		return nil
+	})
+}
+
+// excludeColumns drops the excluded columns from a selected stream's selected_columns. A
+// selected_streams entry discover writes under streams v2 leaves selected_columns unset, which
+// selects every column, so the list is then built from the stream's selectable_columns. A catalog
+// with neither, from an older build, is left as it is.
+func excludeColumns(doc map[string]interface{}, namespace, streamName string, stream map[string]interface{}, excluded map[string]bool) {
+	if selectedColumns, ok := stream["selected_columns"].(map[string]interface{}); ok {
+		if columns, ok := selectedColumns["columns"].([]interface{}); ok {
+			selectedColumns["columns"] = withoutColumns(columns, excluded)
+		}
+		return
+	}
+	available := AvailableStreamEntry(doc, namespace, streamName)
+	if available == nil {
+		return
+	}
+	columns, ok := available["selectable_columns"].([]interface{})
+	if !ok {
+		return
+	}
+	stream["selected_columns"] = map[string]interface{}{"columns": withoutColumns(columns, excluded), "sync_new_columns": true}
+}
+
+func withoutColumns(columns []interface{}, excluded map[string]bool) []interface{} {
+	remaining := make([]interface{}, 0, len(columns))
+	for _, column := range columns {
+		if !excluded[fmt.Sprint(column)] {
+			remaining = append(remaining, column)
+		}
+	}
+	return remaining
+}
+
+func CopyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", src, err)
+	}
+	return WriteHostFile(dst, data)
+}
+
+// SaveStateFile copies state.json to the checkpoint state file.
+func SaveStateFile(config *TestConfig) error {
+	return CopyFile(config.GetFilePath("state.json"), config.GetFilePath("state_checkpoint.json"))
+}
+
+// RestoreStateFile replaces state.json with the previously saved checkpoint backup.
+func RestoreStateFile(config *TestConfig) error {
+	return CopyFile(config.GetFilePath("state_checkpoint.json"), config.GetFilePath("state.json"))
+}
+
+// syncTestCase represents a test case for sync operations
+// RenderOlakeFailure formats a failed sync's exit, translating the one code worth translating: 137 is
+// SIGKILL, which in this harness almost always means the --memory cap or the docker VM OOM-killed
+func RenderOlakeFailure(code int, err error, out []byte) error {
+	hint := ""
+	if code == 137 {
+		hint = " [exit 137 = SIGKILL: the container was OOM-killed -- see the --memory cap and the docker VM's total memory]"
+	}
+	if err != nil {
+		return fmt.Errorf("sync failed (%d)%s: %s\n%s", code, hint, err, out)
+	}
+	return fmt.Errorf("sync failed (%d)%s\n%s", code, hint, out)
+}
+
+// KeepTestData reports whether the test suite should keep the source data after a run, for debugging.
+func KeepTestData() bool {
+	return strings.EqualFold(os.Getenv(KeepTestDataEnvVar), "true")
+}

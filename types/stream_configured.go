@@ -1,0 +1,359 @@
+package types
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/datazip-inc/olake/utils"
+)
+
+// Input/Processed object for Stream
+type ConfiguredStream struct {
+	StreamMetadata StreamMetadata `json:"-"`
+	Stream         *Stream        `json:"stream,omitempty"`
+}
+
+type FilterConfig struct {
+	LogicalOperator string            `json:"logical_operator,omitempty"`
+	Conditions      []FilterCondition `json:"conditions,omitempty"`
+}
+
+type FilterCondition struct {
+	Column   string `json:"column,omitempty"`
+	Operator string `json:"operator,omitempty"`
+	Value    any    `json:"value"`
+}
+
+func (s *ConfiguredStream) ID() string {
+	return s.Stream.ID()
+}
+
+func (s *ConfiguredStream) Self() *ConfiguredStream {
+	return s
+}
+
+func (s *ConfiguredStream) Name() string {
+	return s.Stream.Name
+}
+
+func (s *ConfiguredStream) GetStream() *Stream {
+	return s.Stream
+}
+
+func (s *ConfiguredStream) Namespace() string {
+	return s.Stream.Namespace
+}
+
+func (s *ConfiguredStream) Schema() *TypeSchema {
+	return s.Stream.Schema
+}
+
+// GetUnSelectedColumnsSet returns a set of columns that are NOT selected, based on the provided
+// selected columns list and the stream's current schema snapshot.
+//
+// Note: this relies on the stream schema representing only the previously known columns. If the
+// schema already includes newly discovered columns, we cannot distinguish explicit unselection
+// from newly discovered columns.
+func (s *ConfiguredStream) GetUnSelectedColumnsSet(columns []string) *Set[string] {
+	if len(columns) == 0 {
+		return NewSet[string]()
+	}
+
+	selectedColumnsSet := NewSet(columns...)
+	unselectedColumnsSet := NewSet[string]()
+
+	s.Stream.Schema.Properties.Range(func(col, _ interface{}) bool {
+		colName, ok := col.(string)
+		if !ok {
+			return true
+		}
+		if !selectedColumnsSet.Exists(colName) {
+			unselectedColumnsSet.Insert(colName)
+		}
+		return true
+	})
+
+	return unselectedColumnsSet
+}
+
+// RetainSelectedColumns returns a function that filters record data based on the stream's
+// SelectedColumns configuration.
+func (s *ConfiguredStream) RetainSelectedColumns() func(map[string]interface{}) map[string]interface{} {
+	selectedColumns := s.StreamMetadata.SelectedColumns
+
+	// Backward compatibility:
+	// Older catalogs (streams.json) may not have the selected_columns field at all.
+	// In that case SelectedColumns will be nil after unmarshalling, so we return the data as is.
+	if selectedColumns == nil {
+		return func(data map[string]interface{}) map[string]interface{} {
+			return data
+		}
+	}
+
+	selectedColumnsSet := NewSet(selectedColumns.Columns...)
+	unselectedColumnsSet := s.GetUnSelectedColumnsSet(selectedColumns.Columns)
+	syncNewColumns := selectedColumns.SyncNewColumns
+
+	return func(data map[string]interface{}) map[string]interface{} {
+		if len(selectedColumns.Columns) == 0 {
+			return data
+		}
+
+		if syncNewColumns {
+			// emit all columns except those that are unselected
+			// this ensures all columns that are new are selected by default
+			unselectedColumnsSet.Range(func(col string) {
+				delete(data, col)
+			})
+		} else {
+			// emit only columns that are selected
+			for col := range data {
+				if !selectedColumnsSet.Exists(col) {
+					delete(data, col)
+				}
+			}
+		}
+		return data
+	}
+}
+
+// ResolveColumnName returns the output column name based on the stream naming strategy, preserving the source name when use_source_column_names is enabled, otherwise applying utils.Reformat().
+func (s *ConfiguredStream) ResolveColumnName(key string) string {
+	if s.StreamMetadata.UseSourceColumnNames {
+		return key
+	}
+	return utils.Reformat(key)
+}
+
+// IsSelectedColumn returns a predicate that tells whether a column should be
+// emitted for this stream, based on the stream's SelectedColumns configuration.
+// Both the configured column list and the incoming key are resolved via
+// ResolveColumnName so source vs destination naming is handled transparently.
+func (s *ConfiguredStream) IsSelectedColumn() func(string) bool {
+	selectedColsCfg := s.StreamMetadata.SelectedColumns
+	if selectedColsCfg == nil || len(selectedColsCfg.Columns) == 0 {
+		return func(string) bool { return true }
+	}
+	reformatColumns := func(columnsSet *Set[string]) *Set[string] {
+		out := NewSet[string]()
+		for _, col := range columnsSet.Array() {
+			out.Insert(s.ResolveColumnName(col))
+		}
+		return out
+	}
+
+	if selectedColsCfg.SyncNewColumns {
+		unselected := s.GetUnSelectedColumnsSet(selectedColsCfg.Columns)
+		unselected = reformatColumns(unselected)
+		return func(col string) bool {
+			return !unselected.Exists(col)
+		}
+	}
+
+	selected := NewSet(selectedColsCfg.Columns...)
+	selected = reformatColumns(selected)
+	return func(col string) bool {
+		return selected.Exists(col)
+	}
+}
+
+func (s *ConfiguredStream) SupportedSyncModes() *Set[SyncMode] {
+	return s.Stream.SupportedSyncModes
+}
+
+func (s *ConfiguredStream) defaultStreamProperties() DefaultStreamProperties {
+	if s.Stream != nil && s.Stream.DefaultStreamProperties != nil {
+		return *s.Stream.DefaultStreamProperties
+	}
+	return DefaultStreamProperties{}
+}
+
+func (s *ConfiguredStream) GetSyncMode() SyncMode {
+	return resolveConfigurableField(s.StreamMetadata.SyncMode, s.Stream.SyncMode)
+}
+
+func (s *ConfiguredStream) GetDestinationDatabase(icebergDB *string) string {
+	destDB := resolveConfigurableField(s.StreamMetadata.DestinationDatabase, s.Stream.DestinationDatabase)
+	if destDB != "" {
+		return utils.Reformat(destDB)
+	}
+	if icebergDB != nil && *icebergDB != "" {
+		return *icebergDB
+	}
+	return s.Stream.Namespace
+}
+
+func (s *ConfiguredStream) GetDestinationTable() string {
+	destTable := resolveConfigurableField(s.StreamMetadata.DestinationTable, s.Stream.DestinationTable)
+	return utils.Ternary(destTable == "", s.Stream.Name, destTable).(string)
+}
+
+func (s *ConfiguredStream) GetPartitionRegex() string {
+	return s.StreamMetadata.PartitionRegex
+}
+
+// returns primary and secondary cursor
+func (s *ConfiguredStream) Cursor() (string, string) {
+	cursorField := resolveConfigurableField(s.StreamMetadata.CursorField, s.Stream.CursorField)
+	cursorFields := strings.Split(cursorField, ":")
+	primaryCursor := cursorFields[0]
+	secondaryCursor := ""
+	if len(cursorFields) > 1 {
+		secondaryCursor = cursorFields[1]
+	}
+	return primaryCursor, secondaryCursor
+}
+
+// GetFilter returns the configured filter for this stream in a normalized form.
+//
+// The returned FilterConfig is always the parsed representation of the filter:
+//   - If StreamMetadata.FilterConfig is set and has at least one condition,
+//     that value is returned as-is (after normalizing the logical operator),
+//     and isLegacy is false.
+//   - Otherwise, the legacy string-based StreamMetadata.Filter is parsed into
+//     a FilterConfig using the legacy regex parser. In this case isLegacy is true.
+//
+// Return values:
+//   - FilterConfig: parsed filter definition (may be empty if no filter is configured)
+//   - isLegacy:   true if the filter came from the legacy string field, false if it
+//     came from the new structured FilterConfig field
+//   - error:      non-nil only if the legacy string filter is non-empty and fails
+//     to parse; new structured filters do not return parse errors here.
+func (s *ConfiguredStream) GetFilter() (FilterConfig, bool, error) {
+	//new filter input — only apply structured filter_config when normalization is enabled
+	if s.NormalizationEnabled() && s.StreamMetadata.FilterConfig != nil && len(s.StreamMetadata.FilterConfig.Conditions) > 0 {
+		// Copy before normalizing to avoid a data race: GetFilter is called concurrently
+		// from multiple chunk goroutines that share the same ConfiguredStream pointer.
+		fc := *s.StreamMetadata.FilterConfig
+		fc.LogicalOperator = utils.Reformat(fc.LogicalOperator)
+		return fc, false, nil
+	}
+
+	// legacy filter input
+	filter := strings.TrimSpace(s.StreamMetadata.Filter)
+	if filter == "" {
+		return FilterConfig{}, true, nil
+	}
+	// FilterRegex supports the following filter patterns:
+	// Single condition:
+	//   - Normal columns: age > 18, status = \"active\", count != 0
+	//   - Special char columns (quoted): \"user-name\" = \"john\", \"email@domain\" = \"test@example.com\"
+	//   - Numeric values: price >= 99.99, discount <= 0.5, id = 123
+	//   - Quoted string values: name = \"John Doe\", city = \"New York\", a = \"val\"
+	//   - Mixed special chars: \"column.name\" > 10, \"data[0]\" = \"value\"
+	// Two conditions with logical operators:
+	//   - AND operator: age > 18 AND status = \"active\"
+	//   - OR operator: role != \"admin\" OR role = \"moderator\"
+	//   - Mixed types: \"user-id\" = 123 AND \"is-active\" = true
+	//   - Special chars both sides: \"first name\" = "John" AND \"last-name\" = \"Doe\"
+	//   - Case insensitive: age > 18 and status = active, price < 100 or discount > 0
+	// Supported operators: =, !=, <, >, <=, >=
+	// Value types: quoted strings, integers, floats (including negative), decimals, unquoted words
+	var FilterRegex = regexp.MustCompile(`^(?:"([^"]*)"|(\w+))\s*(>=|<=|!=|>|<|=)\s*((?:"[^"]*"|-?\d+\.\d+|-?\d+|\.\d+|\w+))\s*(?:((?i:and|or))\s*(?:"([^"]*)"|(\w+))\s*(>=|<=|!=|>|<|=)\s*((?:"[^"]*"|-?\d+\.\d+|-?\d+|\.\d+|\w+)))?\s*$`)
+	matches := FilterRegex.FindStringSubmatch(filter)
+	if len(matches) == 0 {
+		return FilterConfig{}, true, fmt.Errorf("invalid filter format: %s", filter)
+	}
+
+	var conditions []FilterCondition
+	conditions = append(conditions, FilterCondition{
+		Column:   utils.ExtractColumnName(matches[1], matches[2]),
+		Operator: matches[3],
+		Value:    matches[4],
+	})
+
+	// Check if there's a logical operator (and/or)
+	logicalOp := matches[5]
+	if logicalOp != "" {
+		conditions = append(conditions, FilterCondition{
+			Column:   utils.ExtractColumnName(matches[6], matches[7]),
+			Operator: matches[8],
+			Value:    matches[9],
+		})
+	}
+
+	return FilterConfig{
+		Conditions:      conditions,
+		LogicalOperator: logicalOp,
+	}, true, nil
+}
+
+// Validate Configured Stream with Source Stream
+func (s *ConfiguredStream) Validate(source *Stream) error {
+	syncMode := s.GetSyncMode()
+	if !source.SupportedSyncModes.Exists(syncMode) {
+		return fmt.Errorf("invalid sync mode[%s]; valid are %v", syncMode, source.SupportedSyncModes)
+	}
+
+	// no cursor validation in cdc and backfill sync
+	if syncMode == INCREMENTAL {
+		primaryCursor, secondaryCursor := s.Cursor()
+		if !source.AvailableCursorFields.Exists(primaryCursor) {
+			return fmt.Errorf("invalid cursor field [%s]; valid are %v", primaryCursor, source.AvailableCursorFields)
+		}
+		if secondaryCursor != "" && !source.AvailableCursorFields.Exists(secondaryCursor) {
+			return fmt.Errorf("invalid secondary cursor field [%s]; valid are %v", secondaryCursor, source.AvailableCursorFields)
+		}
+	}
+
+	if source.SourceDefinedPrimaryKey.ProperSubsetOf(s.Stream.SourceDefinedPrimaryKey) {
+		return fmt.Errorf("differnce found with primary keys: %v", source.SourceDefinedPrimaryKey.Difference(s.Stream.SourceDefinedPrimaryKey).Array())
+	}
+
+	return nil
+}
+
+func (s *ConfiguredStream) NormalizationEnabled() bool {
+	if s.StreamMetadata.Normalization != nil {
+		return *s.StreamMetadata.Normalization
+	}
+	return s.defaultStreamProperties().Normalization
+}
+
+func (s *ConfiguredStream) AppendModeEnabled() bool {
+	if s.StreamMetadata.AppendMode != nil {
+		return *s.StreamMetadata.AppendMode
+	}
+	return s.defaultStreamProperties().AppendMode
+}
+
+// GetUpdateType returns the stream's delete format. An omitted (nil) update_type follows
+// the stream's default_stream_properties. Kafka discover defaults that to positional so
+// upsert (no create vs update) does not fall through to equality; an explicit dv is kept.
+func (s *ConfiguredStream) GetUpdateType() UpdateType {
+	if s.StreamMetadata.UpdateType == nil {
+		return resolveConfigurableField(s.defaultStreamProperties().UpdateType, UpdateTypeEquality)
+	}
+	return resolveConfigurableField(UpdateType(*s.StreamMetadata.UpdateType), UpdateTypeEquality)
+}
+
+// ValidateUpdateType reports whether the stream's delete format is set, writable, and readable
+// by the target query engines recorded in its available_update_types.
+func (s *ConfiguredStream) ValidateUpdateType(destinationType DestinationType) error {
+	// Without upserts no deletes are written, so the delete format is never used.
+	if !s.UpsertApplies(destinationType) {
+		return nil
+	}
+
+	available := s.Stream.AvailableUpdateTypes
+	// Discover clears update_type when the target query engines can no longer read it; blank
+	// would otherwise default to equality and silently switch the stream's delete format.
+	if s.StreamMetadata.UpdateType != nil && *s.StreamMetadata.UpdateType == "" && len(available) > 0 {
+		return fmt.Errorf("update mode not set; choose one of %v", available)
+	}
+
+	return s.GetUpdateType().ValidateAgainst(available)
+}
+
+// UpsertApplies reports whether append_mode, update_type and dedup_keys affect what is written.
+// Parquet always appends, so they never do there.
+func (s *ConfiguredStream) UpsertApplies(destinationType DestinationType) bool {
+	return !s.AppendModeEnabled() && UpsertSupported(destinationType)
+}
+
+// ResolveUpsertOp is true when the source cannot differentiate create from update.
+// Kafka upsert (!append && dedup_keys set).
+func (s *ConfiguredStream) ResolveUpsertOp() bool {
+	return !s.AppendModeEnabled() && len(s.StreamMetadata.DedupKeys) > 0
+}

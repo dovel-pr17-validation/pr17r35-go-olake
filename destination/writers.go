@@ -1,0 +1,423 @@
+package destination
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/pkg/indexdb"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+	"github.com/datazip-inc/olake/utils/logger"
+)
+
+type (
+	initWriter func(config any) (Writer, func(ctx context.Context), error)
+
+	Options struct {
+		Backfill                 bool
+		ThreadID                 string
+		ApplyFilter              bool
+		KeepDeletesThroughFilter bool
+		// TableIndex maps _olake_id to the row's location in the destination table.
+		TableIndex types.StreamIndex
+	}
+
+	ThreadOptions func(opt *Options)
+	writerSchema  struct {
+		mu          sync.RWMutex
+		schema      any
+		streamIndex types.StreamIndex
+	}
+
+	Stats struct {
+		TotalRecordsToSync atomic.Int64 // total record that are required to sync
+		ReadCount          atomic.Int64 // records that got read
+		RecordsFiltered    atomic.Int64 // records that got filtered
+		ThreadCount        atomic.Int64 // total number of writer threads
+		BytesRead          atomic.Int64 // source bytes read (added live per record via Push, rolled back on chunk/run failure)
+	}
+
+	WriterPool struct {
+		stats        *Stats
+		initWriter   initWriter
+		shutdown     func(ctx context.Context)
+		writerSchema sync.Map
+		batchSize    int64
+	}
+
+	// writer thread used by reader
+	WriterThread struct {
+		stats          *Stats
+		buffer         []types.RawRecord
+		threadID       string
+		writer         Writer
+		batchSize      int64
+		streamArtifact *writerSchema
+		group          *utils.CxGroup
+		// recordsPushed / recordsFiltered / bytesPushed track this thread's own
+		// contribution to the pool-wide ReadCount / RecordsFiltered / BytesRead
+		// stats. The stats are updated live as records are read; if the chunk/run
+		// fails (or is retried), Close rolls these contributions back so the stats —
+		// and the RPS derived from them — reflect only committed data.
+		recordsPushed   atomic.Int64
+		recordsFiltered atomic.Int64
+		bytesPushed     atomic.Int64
+		bufferBytes     int64 // source bytes currently held in buffer (for byte-based flush)
+	}
+)
+
+var RegisteredWriters = map[types.DestinationType]initWriter{}
+
+func WithBackfill(backfill bool) ThreadOptions {
+	return func(opt *Options) {
+		opt.Backfill = backfill
+	}
+}
+
+func WithThreadID(threadID string) ThreadOptions {
+	return func(opt *Options) {
+		opt.ThreadID = threadID
+	}
+}
+func WithApplyFilter(applyFilter bool) ThreadOptions {
+	return func(opt *Options) {
+		opt.ApplyFilter = applyFilter
+	}
+}
+
+func WithKeepDeletesThroughFilter(keep bool) ThreadOptions {
+	return func(opt *Options) {
+		opt.KeepDeletesThroughFilter = keep
+	}
+}
+
+// NewWriterPool manages a destination's shared resources (e.g., Iceberg JVM) and connection health.
+// It initializes global state, runs checks, and provides thread-level writers. Call Close() to clean up.
+func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams []types.StreamInterface, batchSize int64) (*WriterPool, error) {
+	initWriter, found := RegisteredWriters[config.Type]
+	if !found {
+		return nil, errs.Precondition(errs.ConfigInvalid, codeDestinationTypeInvalid,
+			fmt.Errorf("invalid destination type has been passed [%s]", config.Type))
+	}
+
+	adapter, shutdown, err := initWriter(config.WriterConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize destination: %w", err)
+	}
+	pool := &WriterPool{
+		stats: &Stats{
+			TotalRecordsToSync: atomic.Int64{},
+			ThreadCount:        atomic.Int64{},
+			ReadCount:          atomic.Int64{},
+			RecordsFiltered:    atomic.Int64{},
+		},
+		initWriter: initWriter,
+		shutdown:   shutdown,
+		batchSize:  batchSize,
+	}
+
+	stopCheck := logger.TrackTiming("destination", "check")
+	err = adapter.Check(ctx)
+	stopCheck()
+	if err != nil {
+		return nil, fmt.Errorf("failed to test destination: %w", err)
+	}
+
+	for _, stream := range syncStreams {
+		artifact := &writerSchema{
+			mu:     sync.RWMutex{},
+			schema: nil,
+		}
+
+		if !stream.AppendModeEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type) {
+			streamIndex, err := indexdb.Open(stream)
+			if err != nil {
+				pool.Shutdown(ctx)
+				return nil, err
+			}
+			artifact.streamIndex = streamIndex
+		}
+
+		pool.writerSchema.Store(stream.ID(), artifact)
+	}
+
+	return pool, nil
+}
+
+// Shutdown tears down destination-level process resources (like the Iceberg Java server)
+func (w *WriterPool) Shutdown(ctx context.Context) {
+	w.writerSchema.Range(func(key, value any) bool {
+		if artifact, ok := value.(*writerSchema); ok && artifact.streamIndex != nil {
+			if err := artifact.streamIndex.Close(); err != nil {
+				logger.Errorf("failed to close stream index for stream[%v]: %s", key, err)
+			}
+		}
+		return true
+	})
+
+	if w.shutdown != nil {
+		w.shutdown(ctx)
+	}
+}
+
+func (w *WriterPool) AddRecordsToSyncStats(count int64) {
+	w.stats.TotalRecordsToSync.Add(count)
+}
+
+func (w *WriterPool) GetStats() *Stats {
+	return w.stats
+}
+
+func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface, options ...ThreadOptions) (*WriterThread, *types.MetadataState, error) {
+	w.stats.ThreadCount.Add(1)
+
+	opts := &Options{}
+	for _, one := range options {
+		one(opts)
+	}
+
+	rawStreamArtifact, ok := w.writerSchema.Load(stream.ID())
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to get stream artifacts for stream[%s]", stream.ID())
+	}
+
+	streamArtifact, ok := rawStreamArtifact.(*writerSchema)
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to convert raw stream artifact[%T] to *StreamArtifact struct", rawStreamArtifact)
+	}
+
+	// Threads of one stream share the stream's index; it is nil in equality mode.
+	// TODO: can we pass things through contexts like streamContext ?
+	opts.TableIndex = streamArtifact.streamIndex
+
+	writerThread, prevStreamState, err := func() (Writer, *types.MetadataState, error) {
+		// init writer and point it at the config parsed once at pool creation,
+		// shared read-only across all writer threads.
+		writerThread, _, err := w.initWriter(nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to initialize writer: %w", err)
+		}
+
+		// setup table and schema
+		streamArtifact.mu.Lock()
+		defer streamArtifact.mu.Unlock()
+
+		threadSchema, prevStreamState, err := writerThread.Setup(ctx, stream, streamArtifact.schema, opts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create writer thread: %w", err)
+		}
+
+		if streamArtifact.schema == nil {
+			// First thread for this stream: cache the schema so subsequent threads
+			// skip parsing the schema out of the GET_OR_CREATE_TABLE response.
+			// metadataState is intentionally NOT cached, every NewWriter call must
+			// receive a fresh olake_2pc snapshot from Java so that retries see the
+			// up-to-date committed chunk IDs / cursor positions.
+			streamArtifact.schema = threadSchema
+		}
+
+		return writerThread, prevStreamState, nil
+	}()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to setup writer thread: %w", err)
+	}
+
+	return &WriterThread{
+		buffer:         []types.RawRecord{},
+		batchSize:      w.batchSize,
+		threadID:       opts.ThreadID,
+		writer:         writerThread,
+		stats:          w.stats,
+		streamArtifact: streamArtifact,
+		group:          utils.NewCGroupWithLimit(ctx, 1), // currently only one thread (To make sure flush can run parallel when buffer filling)
+	}, prevStreamState, nil
+}
+
+// Push appends a record to the thread buffer and updates the live stats. sourceBytes
+// is the record's source read size (0 if the driver does not report it). Buffer batching
+// flushes when buffered source bytes would exceed MaxDestinationBatchBytes. sourceBytes
+// is added live to stats and rolled back by Close if the chunk/run fails (see rollbackStats).
+func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, sourceBytes int64) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wt.group.Ctx().Done():
+		// if group context is done, return the group err (retry error as there can be rate limits on s3)
+		return wt.group.Block()
+	default:
+		wt.stats.ReadCount.Add(1)
+		wt.recordsPushed.Add(1)
+		if sourceBytes != 0 {
+			wt.stats.BytesRead.Add(sourceBytes)
+			wt.bytesPushed.Add(sourceBytes)
+		}
+		wt.buffer = append(wt.buffer, record)
+		wt.bufferBytes += sourceBytes
+		if len(wt.buffer) >= int(wt.batchSize) || wt.bufferBytes >= constants.MaxDestinationBatchBytes {
+			buf := make([]types.RawRecord, len(wt.buffer))
+			copy(buf, wt.buffer)
+			wt.buffer = wt.buffer[:0]
+			wt.bufferBytes = 0
+			wt.group.Add(func(ctx context.Context) error {
+				return wt.flush(ctx, buf)
+			})
+		}
+		return nil
+	}
+}
+
+func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err error) {
+	// skip empty buffers
+	if len(buf) == 0 {
+		return nil
+	}
+
+	defer func() {
+		if err == nil {
+			if rec := recover(); rec != nil {
+				err = fmt.Errorf("panic recovered in flush: %v", rec)
+			}
+		}
+	}()
+
+	// create flush context
+	flushCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	recordsCountBeforeFiltering := len(buf)
+	evolution, buf, threadSchema, err := wt.writer.FlattenAndCleanData(flushCtx, buf)
+	if err != nil {
+		return fmt.Errorf("failed to flatten and clean data: %w", err)
+	}
+	filtered := int64(recordsCountBeforeFiltering - len(buf))
+	wt.stats.RecordsFiltered.Add(filtered)
+	wt.recordsFiltered.Add(filtered)
+	// TODO: after flattening record type raw_record not make sense
+	if evolution {
+		wt.streamArtifact.mu.Lock()
+		newSchema, err := wt.writer.EvolveSchema(flushCtx, wt.streamArtifact.schema, threadSchema)
+		if err == nil && newSchema != nil {
+			wt.streamArtifact.schema = newSchema
+		}
+		wt.streamArtifact.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("failed to evolve schema: %w", err)
+		}
+	}
+
+	if err := wt.writer.Write(flushCtx, buf); err != nil {
+		return fmt.Errorf("failed to write records: %w", err)
+	}
+
+	logger.Infof("Thread[%s]: successfully wrote %d records", wt.threadID, len(buf))
+	return nil
+}
+
+// rollbackStats removes this thread's live contribution to the pool-wide
+// read/filtered/byte counters. Called when the chunk/run does not commit (failure,
+// retry or abort) so the stats reflect only committed data and retried attempts are
+// not double-counted.
+func (wt *WriterThread) rollbackStats() {
+	wt.stats.ReadCount.Add(-wt.recordsPushed.Load())
+	wt.stats.RecordsFiltered.Add(-wt.recordsFiltered.Load())
+	wt.stats.BytesRead.Add(-wt.bytesPushed.Load())
+}
+
+func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) (err error) {
+	select {
+	case <-closeCtx.Done():
+		// Wait for in-flight flushes so rollback below can't race their stat updates.
+		// Block's error is ctx cancellation that brought us here, so ignored.
+		_ = wt.group.Block()
+		// Aborted before commit: writer.Close releases resources without committing,
+		// so nothing this thread pushed reaches the destination — roll its stats back.
+		wt.rollbackStats()
+		if closeErr := wt.writer.Close(closeCtx, finalMetadataState); closeErr != nil {
+			return fmt.Errorf("failed to close writer: %w", closeErr)
+		}
+		return nil
+	default:
+		defer wt.stats.ThreadCount.Add(-1)
+
+		// for canceling on flush error
+		ctx, cancel := context.WithCancel(closeCtx)
+		defer cancel()
+
+		defer func() {
+			if err != nil {
+				cancel()
+			}
+
+			wt.streamArtifact.mu.Lock()
+			defer wt.streamArtifact.mu.Unlock()
+
+			// if error occurred, cancel the context
+			if err != nil {
+				cancel()
+			}
+
+			if closeErr := wt.writer.Close(ctx, finalMetadataState); closeErr != nil {
+				err = utils.Ternary(err == nil, closeErr, fmt.Errorf("%w: flush error: %w", closeErr, err)).(error)
+			}
+
+			// Commit is successful only when both the final flush and writer.Close (dest
+			// COMMIT) returned no error. All source bytes were already added live via
+			// Push, so success needs no action; on any failure roll back this thread's
+			// live read/filtered/byte stats so they count committed data only.
+			if err != nil {
+				wt.rollbackStats()
+			}
+		}()
+
+		wt.group.Add(func(flushCtx context.Context) error {
+			return wt.flush(flushCtx, wt.buffer)
+		})
+
+		if err := wt.group.Block(); err != nil {
+			return fmt.Errorf("failed to flush data while closing: %w", err)
+		}
+
+		return nil
+	}
+}
+
+func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []types.StreamInterface) error {
+	if len(dropStreams) == 0 {
+		return nil
+	}
+
+	// Always drop the stream index: dropStreams carry the new update type, not the one the
+	// index was built under, so a dv/pos -> eq clear would otherwise leave a stale index
+	// that outlives the recreated table. Dropping a missing index is a no-op.
+	for _, stream := range dropStreams {
+		if err := indexdb.Drop(stream); err != nil {
+			return err
+		}
+	}
+
+	initWriter, found := RegisteredWriters[config.Type]
+	if !found {
+		return errs.Precondition(errs.ConfigInvalid, codeDestinationTypeInvalid,
+			fmt.Errorf("invalid destination type has been passed [%s]", config.Type))
+	}
+
+	adapter, shutdown, err := initWriter(config.WriterConfig)
+	if err != nil {
+		return fmt.Errorf("failed to initialize destination: %w", err)
+	}
+
+	defer func() {
+		if shutdown != nil {
+			shutdown(context.Background())
+		}
+	}()
+
+	if err := adapter.DropStreams(ctx, dropStreams); err != nil {
+		return fmt.Errorf("failed to drop streams: %w", err)
+	}
+
+	return nil
+}

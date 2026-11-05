@@ -1,0 +1,131 @@
+package constants
+
+import (
+	"fmt"
+	"time"
+)
+
+const (
+	DefaultRetryCount      = 3
+	DefaultThreadCount     = 3
+	DefaultDiscoverTimeout = 5 * time.Minute
+	DefaultRetryTimeout    = 60 * time.Second
+	GRPCRequestTimeout     = 3600 * time.Second
+	DestError              = "destination error"
+	ParquetFileExt         = "parquet"
+	PartitionRegexIceberg  = `\{([^,]+),\s*([^}]+)\}`
+	PartitionRegexParquet  = `\{([^}]+)\}`
+	MongoPrimaryID         = "_id"
+	OlakeID                = "_olake_id"
+	OlakeTimestamp         = "_olake_timestamp"
+	OpType                 = "_op_type"
+	StringifiedData        = "data"
+	DefaultReadPreference  = "secondaryPreferred"
+	EncryptionKey          = "OLAKE_ENCRYPTION_KEY"
+	EnvStorageMode         = "OLAKE_STORAGE_MODE"
+	StorageModeS3          = "s3"
+	EnvS3Region            = "OLAKE_S3_REGION"
+	EnvS3AccessKeyID       = "OLAKE_S3_ACCESS_KEY_ID"
+	EnvS3SecretAccessKey   = "OLAKE_S3_SECRET_ACCESS_KEY" // #nosec G101 -- env var name, not a credential
+	EnvS3Endpoint          = "OLAKE_S3_ENDPOINT"
+	EnvS3ConfigFolder      = "OLAKE_S3_CONFIG_FOLDER"
+	ConfigFolder           = "CONFIG_FOLDER"
+	StatePath              = "STATE_PATH"
+	StreamsPath            = "STREAMS_PATH"
+	AvailableStreamsPath   = "AVAILABLE_STREAMS_PATH"
+	SelectedStreamsPath    = "SELECTED_STREAMS_PATH"
+	DifferencePath         = "DIFFERENCE_STREAMS_PATH"
+	// output paths of a streams v2 difference
+	DifferenceAvailableStreamsPath = "DIFFERENCE_AVAILABLE_STREAMS_PATH"
+	DifferenceSelectedStreamsPath  = "DIFFERENCE_SELECTED_STREAMS_PATH"
+	// RecommendedCDCLogRetention is the change-log retention (binlog, oplog) recommended so a
+	// paused sync can resume without a full resync.
+	RecommendedCDCLogRetention = 7 * 24 * time.Hour
+	// UpdateMethodCDC and UpdateMethodStandalone are the "type" values of the update_method
+	// config object, which is how a source selects CDC.
+	UpdateMethodCDC        = "CDC"
+	UpdateMethodStandalone = "Standalone"
+	// DestinationDatabasePrefix is used as prefix for destination database name
+	DestinationDatabasePrefix = "DESTINATION_DATABASE_PREFIX"
+	// EffectiveParquetSize is the effective size in bytes considering 256mb targeted parquet size, compression ratio as 8
+	EffectiveParquetSize        = int64(256) * 1024 * 1024 * int64(8)
+	DB2StateTimestampFormat     = "2006-01-02 15:04:05.000000"
+	DefaultStateTimestampFormat = "2006-01-02T15:04:05.000000000Z"
+	// DistributionLower and DistributionUpper define the acceptable range
+	// of the distribution factor for validating evenly distributed numeric PKs.
+	DistributionLower = 0.05
+	DistributionUpper = 1000.0
+	// MysqlChunkAcceptanceRatio defines the minimum ratio of expected chunks that must be generated
+	// for the split to be considered valid.
+	MysqlChunkAcceptanceRatio = float64(0.8)
+	// SamplePercentMin / SamplePercentMax define the clamped range for TABLESAMPLE /
+	// SAMPLE BLOCK percentage used by physloc and ROWID chunk boundary estimation.
+	// 0.01 is the practical floor below which page-level sampling may return zero
+	// rows; 50 caps worst-case I/O so a bad row-count estimate cannot escalate to a
+	// near-full scan.
+	SamplePercentMin = float64(0.01)
+	SamplePercentMax = float64(50.0)
+	// SampleRowsPerChunkMultiplier controls sample density: each target chunk gets
+	// ~10 sample points to pick a boundary from, producing even spacing even when
+	// blocks/pages are clustered (e.g. freshly inserted rows land on adjacent pages).
+	SampleRowsPerChunkMultiplier = int64(10)
+
+	// CdcTimestamp is the column name olake writes the CDC event timestamp into.
+	CdcTimestamp = "_cdc_timestamp"
+
+	// MaxDestinationBatchBytes is the maximum source bytes held in a writer thread buffer before flush.
+	MaxDestinationBatchBytes = int64(1) * 1024 * 1024 * 1024 // 1 GB
+
+	// Index store constants
+	IndexDBDir                = "OLAKE_INDEX_DB_DIR"
+	IndexDBCacheSizePerStream = "OLAKE_INDEX_DB_CACHE_SIZE"
+	MaxOpenFilesPerStream     = "OLAKE_INDEX_DB_MAX_OPEN_FILES"
+	DefaultDirName            = "olake-table-index"
+	DefaultCacheSize          = 128 * 1024 * 1024 // 128 MB default block cache
+	DefaultMemTableSize       = 64 * 1024 * 1024  // 64 MB default memtable
+	DefaultMaxOpenFiles       = 1000
+)
+
+// DriverType identifies a source/destination driver.
+type DriverType string
+
+const (
+	MongoDB  DriverType = "mongodb"
+	Postgres DriverType = "postgres"
+	MySQL    DriverType = "mysql"
+	Oracle   DriverType = "oracle"
+	DB2      DriverType = "db2"
+	S3       DriverType = "s3"
+	Kafka    DriverType = "kafka"
+	MSSQL    DriverType = "mssql"
+)
+
+// Drivers where filters are applied in memory after full refresh data is read.
+var FullRefreshPostReadFilterDrivers = []DriverType{S3, Kafka}
+
+// Kafka tombstones have no filter columns, so CDC delete records (op "d") bypass
+// condition matching in FilterRecords and pass through unfiltered.
+var CDCKeepDeletesThroughFilterDrivers = []DriverType{Kafka}
+
+// DefaultAppendModeDrivers are drivers whose discovered streams default to append-only sync.
+var DefaultAppendModeDrivers = []DriverType{S3, Kafka}
+
+var RelationalDrivers = []DriverType{Postgres, MySQL, Oracle, DB2, MSSQL}
+
+var ParallelCDCDrivers = []DriverType{MongoDB, MSSQL}
+var ErrNonRetryable = fmt.Errorf("failed with non retryable error")
+var ErrGlobalContextGroup = fmt.Errorf("global context group error")
+
+// DriversRequiringIncrementalFormatter are drivers that require special formatting for incremental value
+var DriversRequiringIncrementalFormatter = []DriverType{Oracle, DB2, MSSQL}
+
+var RESTCatalogs = []string{
+	"rest",
+	"lakekeeper",
+	"nessie",
+	"s3tables",
+	"unity",
+	"polaris",
+	"biglake",
+	"horizon",
+}

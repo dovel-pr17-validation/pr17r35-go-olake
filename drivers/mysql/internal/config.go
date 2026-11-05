@@ -1,0 +1,133 @@
+package driver
+
+import (
+	"crypto/tls"
+	"fmt"
+	"maps"
+	"strings"
+
+	"github.com/go-sql-driver/mysql"
+
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+)
+
+// Config represents the configuration for connecting to a MySQL database
+type Config struct {
+	Host             string            `json:"hosts"`
+	Username         string            `json:"username"`
+	Password         string            `json:"password"`
+	Database         string            `json:"database"`
+	Port             int               `json:"port"`
+	JDBCURLParams    map[string]string `json:"jdbc_url_params"`
+	SSLConfiguration *utils.SSLConfig  `json:"ssl"`
+	UpdateMethod     interface{}       `json:"update_method"`
+	MaxThreads       int               `json:"max_threads"`
+	RetryCount       int               `json:"backoff_retry_count"`
+	SSHConfig        *utils.SSHConfig  `json:"ssh_config"`
+}
+
+type CDC struct {
+	InitialWaitTime int `json:"initial_wait_time"`
+}
+
+// URI generates the connection URI for the MySQL database
+func (c *Config) URI() (string, error) {
+	// Set default port if not specified
+	if c.Port == 0 {
+		c.Port = 3306
+	}
+	// Construct host string
+	hostStr := c.Host
+	if c.Host == "" {
+		hostStr = "localhost"
+	}
+
+	cfg := mysql.Config{
+		User:                 c.Username,
+		Passwd:               c.Password,
+		Net:                  "tcp",
+		Addr:                 fmt.Sprintf("%s:%d", hostStr, c.Port),
+		DBName:               c.Database,
+		AllowNativePasswords: true,
+	}
+
+	if c.SSLConfiguration != nil {
+		switch c.SSLConfiguration.Mode {
+		case utils.SSLModeDisable:
+			cfg.TLSConfig = "false"
+		case utils.SSLModeRequire, utils.SSLModeVerifyCA, utils.SSLModeVerifyFull:
+			tlsConfig, err := c.buildTLSConfig()
+			if err != nil {
+				return "", fmt.Errorf("failed to build TLS config: %w", err)
+			}
+			tlsConfigName := "mysql_" + utils.ULID()
+			if err := mysql.RegisterTLSConfig(tlsConfigName, tlsConfig); err != nil {
+				return "", fmt.Errorf("failed to register TLS config: %w", err)
+			}
+			cfg.TLSConfig = tlsConfigName
+		}
+	}
+
+	// Note: It is not recommended to pass Java JDBC params to the MySQL go driver,
+	// as these are two different ecosystems
+	if len(c.JDBCURLParams) > 0 {
+		if cfg.Params == nil {
+			cfg.Params = make(map[string]string)
+		}
+		maps.Copy(cfg.Params, c.JDBCURLParams)
+	}
+
+	return cfg.FormatDSN(), nil
+}
+
+// buildTLSConfig builds a custom TLS configuration for certificate-based SSL
+func (c *Config) buildTLSConfig() (*tls.Config, error) {
+	return utils.BuildTLSConfig(c.Host, c.SSLConfiguration)
+}
+
+// Validate checks the configuration for any missing or invalid fields
+func (c *Config) Validate() error {
+	if c.Host == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeHostMissing, fmt.Errorf("empty host name"))
+	} else if strings.Contains(c.Host, "https") || strings.Contains(c.Host, "http") {
+		return errs.Precondition(errs.ConfigInvalid, codeHostSchemeIncluded,
+			fmt.Errorf("host should not contain http or https: %s", c.Host))
+	}
+
+	// Validate port
+	if c.Port <= 0 || c.Port > 65535 {
+		return errs.Precondition(errs.ConfigInvalid, codePortInvalid,
+			fmt.Errorf("invalid port number: must be between 1 and 65535"))
+	}
+
+	// Validate required fields
+	if c.Username == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeUsernameMissing, fmt.Errorf("username is required"))
+	}
+	if c.Password == "" {
+		return errs.Precondition(errs.ConfigInvalid, codePasswordMissing, fmt.Errorf("password is required"))
+	}
+
+	// Optional database name, default to 'mysql'
+	if c.Database == "" {
+		c.Database = "mysql"
+	}
+
+	if err := utils.ApplyMaxThreadsDefault(&c.MaxThreads); err != nil {
+		return err
+	}
+
+	if err := utils.ApplyRetryCountDefault(&c.RetryCount); err != nil {
+		return err
+	}
+
+	// Validate SSL configuration if provided
+	if c.SSLConfiguration != nil {
+		if err := c.SSLConfiguration.Validate(); err != nil {
+			return fmt.Errorf("failed to validate SSL config: %w", err)
+		}
+	}
+
+	return errs.Precondition(errs.ConfigInvalid, codeConfigValidationFailed, utils.Validate(c))
+}

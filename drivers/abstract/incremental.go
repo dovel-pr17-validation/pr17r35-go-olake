@@ -1,0 +1,248 @@
+package abstract
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/destination"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+func (a *AbstractDriver) Incremental(mainCtx context.Context, pool *destination.WriterPool, streams ...types.StreamInterface) error {
+	backfillWaitChannel := make(chan string, len(streams))
+	defer close(backfillWaitChannel)
+
+	err := utils.ForEach(streams, func(stream types.StreamInterface) error {
+		primaryCursor, secondaryCursor := stream.Cursor()
+		prevPrimaryCursor := a.state.GetCursor(stream.Self(), primaryCursor)
+		prevSecondaryCursor := a.state.GetCursor(stream.Self(), secondaryCursor)
+		if a.state.HasCompletedBackfill(stream.Self()) && (prevPrimaryCursor != nil && (secondaryCursor == "" || prevSecondaryCursor != nil)) {
+			logger.Infof("Backfill skipped for stream[%s], already completed", stream.ID())
+			backfillWaitChannel <- stream.ID()
+			return nil
+		} else if chunks := a.state.GetChunks(stream.Self()); chunks == nil || chunks.Len() == 0 {
+			// This else if condition is added, so that the cursor reset and new cursor fetch is done only if there are no pending chunks
+			// other wise it might cause loss of data if some chunks were already processed with old max cursor values
+
+			// Reset only mentioned cursor state while preserving other state values
+			a.state.ResetCursor(stream.Self())
+
+			maxPrimaryCursorValue, maxSecondaryCursorValue, err := a.driver.FetchMaxCursorValues(mainCtx, stream)
+			if err != nil {
+				return fmt.Errorf("failed to fetch max cursor values: %w", err)
+			}
+
+			a.state.SetCursor(stream.Self(), primaryCursor, a.FormatCursorValue(maxPrimaryCursorValue))
+			if maxPrimaryCursorValue == nil {
+				logger.Warnf("max primary cursor value is nil for stream: %s", stream.ID())
+			}
+			if secondaryCursor != "" {
+				a.state.SetCursor(stream.Self(), secondaryCursor, a.FormatCursorValue(maxSecondaryCursorValue))
+				if maxSecondaryCursorValue == nil {
+					logger.Warnf("max secondary cursor value is nil for stream: %s", stream.ID())
+				}
+			}
+		}
+
+		return a.Backfill(mainCtx, backfillWaitChannel, pool, stream)
+	})
+	if err != nil {
+		return fmt.Errorf("backfill failed: %w", err)
+	}
+
+	// Wait for all backfill processes to complete
+	err = a.waitForBackfillCompletion(mainCtx, backfillWaitChannel, streams, func(streamID string) error {
+		a.GlobalConnGroup.AddWithRetry(a.driver.MaxRetries(), func(gCtx context.Context) (err error) {
+			index, _ := utils.ArrayContains(streams, func(s types.StreamInterface) bool { return s.ID() == streamID })
+			stream := streams[index]
+			primaryCursor, secondaryCursor := stream.Cursor()
+			// TODO: make inremental state consistent save it as string and typecast while reading
+			// get cursor column from state and typecast it to cursor column type for comparisons
+			maxPrimaryCursorValue, maxSecondaryCursorValue, err := a.getIncrementCursorFromState(primaryCursor, secondaryCursor, stream)
+			if err != nil {
+				return fmt.Errorf("failed to get incremental cursor value from state: %w", err)
+			}
+
+			// create incremental context, so that main context not affected if incremental retries
+			incrementalCtx, incrementalCtxCancel := context.WithCancel(gCtx)
+			defer incrementalCtxCancel()
+
+			threadID := generateThreadID(stream.ID(), fmt.Sprintf("%v_%v", maxPrimaryCursorValue, maxSecondaryCursorValue))
+			inserter, prevMetadataState, err := pool.NewWriter(incrementalCtx, stream, destination.WithThreadID(threadID), destination.WithApplyFilter(true))
+			if err != nil {
+				return fmt.Errorf("failed to create new writer thread: %w", err)
+			}
+
+			defer func(ctx context.Context) {
+				if ctx.Err() != nil {
+					return
+				}
+				a.state.SetCursor(stream.Self(), primaryCursor, a.FormatCursorValue(maxPrimaryCursorValue))
+				a.state.SetCursor(stream.Self(), secondaryCursor, a.FormatCursorValue(maxSecondaryCursorValue))
+			}(incrementalCtx)
+
+			var mtState any
+			defer handleWriterCleanup(incrementalCtx, incrementalCtxCancel, &err, inserter, threadID, &mtState, nil)
+
+			// threadID is derived from the cursor, which moves only when records are read. Committing
+			// metadata state for a record-less sync would store state whose ID equals the next sync's
+			// threadID, which the recovery check below treats as a failed state update, stalling the stream.
+			recordsRead := false
+			defer func() {
+				if !recordsRead {
+					return
+				}
+				mtStateMap := map[string]any{primaryCursor: a.FormatCursorValue(maxPrimaryCursorValue)}
+				if secondaryCursor != "" {
+					mtStateMap[secondaryCursor] = a.FormatCursorValue(maxSecondaryCursorValue)
+				}
+				mtState = mtStateMap
+			}()
+
+			// prevMetadataState id will be same as thread id if the state file failed to update
+			if prevMetadataState != nil && threadID == prevMetadataState.ID && prevMetadataState.State != nil {
+				stateString, ok := prevMetadataState.State.(string)
+				if !ok {
+					return errs.Precondition(errs.StateInvalid,
+						fmt.Sprintf("%s.metadata_state_invalid", a.driver.Type()),
+						fmt.Errorf("failed to unmarshal previous metadata state of type[%T]", prevMetadataState.State))
+				}
+
+				var mtState map[string]any
+				if err := json.Unmarshal([]byte(stateString), &mtState); err != nil {
+					return fmt.Errorf("failed to unmarshal previous metadata state: %w", err)
+				}
+
+				// detect cursor value difference
+				if mtState[primaryCursor] == nil || (secondaryCursor != "" && mtState[secondaryCursor] == nil) {
+					return errs.Precondition(errs.StateInvalid,
+						fmt.Sprintf("%s.cursor_field_changed", a.driver.Type()),
+						fmt.Errorf("cursor value is nil in the metadata state for stream[%s] and thread[%s], cursor field got changed. Please run clear destination first", stream.ID(), threadID))
+				}
+
+				logger.Infof("Stream[%s] cursor(s) mismatch, updating cursor(s) in state", stream.ID())
+				maxPrimaryCursorValue = mtState[primaryCursor]
+				if secondaryCursor != "" {
+					maxSecondaryCursorValue = mtState[secondaryCursor]
+				}
+				return nil
+			}
+
+			logger.Infof("Thread[%s]: created incremental writer for stream %s", threadID, streams[index].ID())
+
+			filterDataBySelectedColumnsFn := stream.RetainSelectedColumns()
+
+			// No retry logic here - retry happens at Read level
+			return a.driver.StreamIncrementalChanges(incrementalCtx, stream, func(ctx context.Context, record map[string]any, sourceBytes int64) error {
+				recordsRead = true
+				maxPrimaryCursorValue, maxSecondaryCursorValue = a.getMaxIncrementCursorFromData(primaryCursor, secondaryCursor, maxPrimaryCursorValue, maxSecondaryCursorValue, record)
+				olakeColumns := map[string]any{
+					constants.OlakeID:        utils.GetKeysHash(record, stream.GetStream().SourceDefinedPrimaryKey.Array()...),
+					constants.OpType:         "u",
+					constants.OlakeTimestamp: time.Now().UTC(),
+				}
+				filteredData := filterDataBySelectedColumnsFn(record)
+				return inserter.Push(ctx, types.CreateRawRecord(filteredData, olakeColumns), sourceBytes)
+			})
+		})
+		return nil
+	})
+	if err == constants.ErrGlobalContextGroup {
+		// err will be captured in err group block statement
+		return nil
+	}
+
+	return err
+}
+
+// RefomratCursorValue to parse the cursor value to the correct type
+func ReformatCursorValue(cursorField string, cursorValue any, stream types.StreamInterface) (any, error) {
+	if cursorField == "" {
+		return cursorValue, nil
+	}
+	cursorColType, err := stream.Schema().GetType(cursorField)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cursor column type: %w", err)
+	}
+	cursorValue, err = DecodeCursorValue(cursorField, cursorColType, cursorValue)
+	if err != nil {
+		return nil, err
+	}
+	return typeutils.ReformatValue(cursorColType, cursorValue)
+}
+
+// DecodeCursorValue returns the value a cursor's state entry stands for, given the cursor column's
+// type. JSON cannot carry bytes, so FormatCursorValue keeps a binary cursor as hex and it decodes
+// back to its bytes here; every other cursor is kept in state as its value.
+func DecodeCursorValue(cursorField string, cursorType types.DataType, stateValue any) (any, error) {
+	encoded, isString := stateValue.(string)
+	if !isString || cursorType != types.Binary {
+		return stateValue, nil
+	}
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode the state value of binary cursor[%s]: %w", cursorField, err)
+	}
+	return decoded, nil
+}
+
+// returns typecasted increment cursor
+func (a *AbstractDriver) getIncrementCursorFromState(primaryCursorField string, secondaryCursorField string, stream types.StreamInterface) (any, any, error) {
+	primaryStateCursorValue := a.state.GetCursor(stream.Self(), primaryCursorField)
+	secondaryStateCursorValue := a.state.GetCursor(stream.Self(), secondaryCursorField)
+
+	// typecast in case state was read from file
+	primaryCursorValue, err := ReformatCursorValue(primaryCursorField, primaryStateCursorValue, stream)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to typecast primary cursor value: %w", err)
+	}
+	secondaryCursorValue, err := ReformatCursorValue(secondaryCursorField, secondaryStateCursorValue, stream)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to typecast secondary cursor value: %w", err)
+	}
+	return primaryCursorValue, secondaryCursorValue, nil
+}
+
+func (a *AbstractDriver) getMaxIncrementCursorFromData(primaryCursor, secondaryCursor string, maxPrimaryCursorValue, maxSecondaryCursorValue any, data map[string]any) (any, any) {
+	primaryCursorValue := data[primaryCursor]
+	primaryCursorValue = utils.Ternary(typeutils.Compare(primaryCursorValue, maxPrimaryCursorValue) == 1, primaryCursorValue, maxPrimaryCursorValue)
+
+	var secondaryCursorValue any
+	if secondaryCursor != "" {
+		secondaryCursorValue = data[secondaryCursor]
+		secondaryCursorValue = utils.Ternary(typeutils.Compare(secondaryCursorValue, maxSecondaryCursorValue) == 1, secondaryCursorValue, maxSecondaryCursorValue)
+	}
+	return primaryCursorValue, secondaryCursorValue
+}
+
+// FormatCursorValue is used to make time format and object id format consistent to be saved in state
+func (a *AbstractDriver) FormatCursorValue(cursorValue any) any {
+	switch v := cursorValue.(type) {
+	case time.Time:
+		// db2 timestamp does NOT store timezone information. Applying v.UTC() changes the actual time value for db2.
+		if a.driver.Type() == string(constants.DB2) {
+			return v.Format(constants.DB2StateTimestampFormat)
+		}
+		return v.UTC().Format(constants.DefaultStateTimestampFormat)
+	case primitive.ObjectID:
+		return v.Hex()
+	case []byte:
+		switch {
+		case !utils.IsBinarySupported():
+			return cursorValue
+		default:
+			return hex.EncodeToString(v)
+		}
+	default:
+		return cursorValue
+	}
+}

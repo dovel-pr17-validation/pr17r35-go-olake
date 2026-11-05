@@ -1,0 +1,336 @@
+// This file holds the small, dependency-light helpers the tests tree needs. Each one is a copy
+// of an olake helper of the same name: the tests are a separate module and deliberately do not
+// depend on olake, so they carry their own copy rather than sharing one through lib.
+package testutils
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+// Ternary returns cond ? a : b.
+func Ternary(cond bool, a, b any) any {
+	if cond {
+		return a
+	}
+	return b
+}
+
+// Average returns the average of the given values, 0 for an empty slice.
+func Average[T int | int8 | int16 | int32 | int64 | float32 | float64](values []T) float64 {
+	if len(values) == 0 {
+		return 0.0
+	}
+	var sum float64
+	for _, v := range values {
+		sum += float64(v)
+	}
+	return sum / float64(len(values))
+}
+
+// UnmarshalFile reads the JSON file at path into dest. The ignored bool mirrors olake's
+// credsFile flag for signature compatibility; this copy never decrypts.
+func UnmarshalFile(file string, dest any, _ bool) error {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return fmt.Errorf("file not found : %s", err)
+	}
+	if err := json.Unmarshal(data, dest); err != nil {
+		return fmt.Errorf("failed to unmarshal file[%s]: %s", file, err)
+	}
+	return nil
+}
+
+// FileLoggerWithPath marshals content to JSON and writes it to path, truncating any existing file.
+func FileLoggerWithPath(content any, path string) error {
+	if path == "" {
+		return fmt.Errorf("path is not set")
+	}
+	contentBytes, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("failed to marshal content: %s", err)
+	}
+	if err := os.WriteFile(path, contentBytes, 0600); err != nil {
+		return fmt.Errorf("failed to write data to file: %s", err)
+	}
+	return nil
+}
+
+// NormalizedEqual reports whether two JSON documents are structurally equal, ignoring
+// whitespace, object key order and array order. Numbers compare exactly as written, like
+// ParseJSONDoc reads them, so integers past 2^53 stay distinct.
+func NormalizedEqual(strune1, strune2 string) bool {
+	unmarshal := func(s string, doc *interface{}) error {
+		dec := json.NewDecoder(strings.NewReader(s))
+		dec.UseNumber()
+		return dec.Decode(doc)
+	}
+	decode := func(s string) (interface{}, bool) {
+		var doc interface{}
+		if unmarshal(s, &doc) == nil {
+			return canonicalJSON(doc), true
+		}
+		start := strings.IndexRune(s, '{')
+		end := strings.LastIndex(s, "}")
+		if start < 0 || end < 0 || start > end {
+			return nil, false
+		}
+		if unmarshal(s[start:end+1], &doc) != nil {
+			return nil, false
+		}
+		return canonicalJSON(doc), true
+	}
+
+	d1, ok1 := decode(strune1)
+	d2, ok2 := decode(strune2)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return jsonCanonicalString(d1) == jsonCanonicalString(d2)
+}
+
+// canonicalJSON rewrites a decoded document so that array order carries no meaning: every array
+// is sorted by its own serialization. Object key order is already canonical because encoding/json
+// marshals map keys sorted.
+func canonicalJSON(v interface{}) interface{} {
+	switch v := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			out[key] = canonicalJSON(val)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, elem := range v {
+			out = append(out, canonicalJSON(elem))
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return jsonCanonicalString(out[i]) < jsonCanonicalString(out[j])
+		})
+		return out
+	default:
+		return v
+	}
+}
+
+func jsonCanonicalString(v interface{}) string {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(encoded)
+}
+
+// Reformat lowercases key and replaces every non-alphanumeric symbol with '_', matching how
+// olake normalizes column names before writing them to a destination.
+func Reformat(key string) string {
+	key = strings.ToLower(key)
+	var result strings.Builder
+	for _, symbol := range key {
+		if (symbol >= 'a' && symbol <= 'z') || (symbol >= '0' && symbol <= '9') {
+			result.WriteRune(symbol)
+		} else {
+			result.WriteRune('_')
+		}
+	}
+	return result.String()
+}
+
+// ParseFloat64 converts a value to float64.
+func ParseFloat64(v any) (float64, error) {
+	switch v := v.(type) {
+	case json.Number:
+		return v.Float64()
+	case float32:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to change string %v to float64: %s", v, err)
+		}
+		return f, nil
+	}
+	return 0, fmt.Errorf("failed to change %v (type:%T) to float64", v, v)
+}
+
+// Concurrent runs execute for every element of array with the given concurrency limit.
+func Concurrent[T any](ctx context.Context, array []T, concurrency int, execute func(ctx context.Context, one T, executionNumber int) error) error {
+	executor, ctx := errgroup.WithContext(ctx)
+	executor.SetLimit(concurrency)
+
+	for idx, one := range array {
+		executor.Go(func() error {
+			return execute(ctx, one, idx)
+		})
+	}
+
+	return executor.Wait()
+}
+
+// RetryOnBackoff invokes f once and retries it up to attempts times with a doubling
+// backoff sleep between attempts (i.e. at most attempts+1 total invocations).
+// olake's version additionally logs each attempt and gives up early on
+// constants.ErrNonRetryable, neither of which the tests need.
+func RetryOnBackoff(ctx context.Context, attempts int, sleep time.Duration, f func(ctx context.Context) error) (err error) {
+	attempts = attempts + 1
+	for cur := range attempts {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err = f(ctx); err == nil {
+				return nil
+			}
+		}
+		if attempts > 1 && cur != attempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleep):
+				sleep = sleep * 2
+			}
+		}
+	}
+	return err
+}
+
+func Combine(components ...string) string {
+	return strings.Join(slices.DeleteFunc(components, func(s string) bool { return s == "" }), "_")
+}
+
+// Plural formats a count with its noun, adding an "s" for anything but one.
+func Plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+type editFunc func(map[string]interface{}) error
+
+// CopyJSONWithEdit reads the JSON at src, applies edit, and writes the result to dst --
+// used to derive a per-suite config from a shared base file without touching the base.
+func CopyJSONWithEdit(src, dst string, edit editFunc) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", src, err)
+	}
+	doc, err := ParseJSONDoc(raw)
+	if err != nil {
+		return fmt.Errorf("failed to parse %s: %s", src, err)
+	}
+	if err := edit(doc); err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal %s: %s", dst, err)
+	}
+	return WriteHostFile(dst, out)
+}
+
+// ParseJSONDoc decodes a JSON object keeping numbers as json.Number, so values the edit does not
+// touch round-trip as their original literals instead of through float64 (which corrupts int64s
+// beyond 2^53 and renders large values in scientific notation).
+func ParseJSONDoc(raw []byte) (map[string]interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]interface{}
+	return doc, dec.Decode(&doc)
+}
+
+// SeedColumnsExcluded is the fixture-side guard for seed exclusion: it verifies every requested
+// column is one the fixture knows how to leave out, so an unknown name fails loudly instead of
+// silently seeding a column the baseline cannot survive.
+func SeedColumnsExcluded(excluded, supported []string) (map[string]bool, error) {
+	drop := make(map[string]bool, len(excluded))
+	for _, col := range excluded {
+		if !slices.Contains(supported, col) {
+			return nil, fmt.Errorf("column %q cannot be excluded from the seed data; the fixture supports excluding only %s",
+				col, strings.Join(supported, ", "))
+		}
+		drop[col] = true
+	}
+	return drop, nil
+}
+
+// CopyDirFiles copies every file in src into dst, replacing what is already there. Files only:
+// a driver's data-format fixtures are a directory of their own, copied as their own source.
+func CopyDirFiles(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %s", src, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := CopyFile(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RepoRoot is the git checkout the tests run from. Read straight from git rather than derived from
+// the running test's directory, which is the one thing here the repo layout does not fix.
+func RepoRoot() (string, error) {
+	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(root)), nil
+}
+
+// ResolveToCommit tells if the string passed resolved to a git commit and returns it, abbreviated
+// the way git itself abbreviates: the short form is what names the image and every path and
+// identifier derived from it, and a full 40-char sha overruns limits those have -- Postgres caps a
+// replication slot name at 63 characters and truncates the overflow silently.
+func ResolveToCommit(gitRootPath, str string) (string, bool) {
+	str = strings.TrimPrefix(str, "sha:")
+	commitPattern := regexp.MustCompile(`^[0-9a-f]{7,40}$`)
+	if !commitPattern.MatchString(str) {
+		return "", false
+	}
+	// --short both verifies the commit exists and picks a length git considers unambiguous here.
+	short, err := exec.Command("git", "-C", gitRootPath, "rev-parse", "--short", str+"^{commit}").Output()
+	if err != nil {
+		return "", false
+	}
+
+	return strings.TrimSpace(string(short)), true
+}
+
+const (
+	red   = "\033[31m"
+	reset = "\033[0m"
+)
+
+// Red paints every non-empty line of message red, the color the harness reports a failure in:
+// an assertion's own report, or a diagnostic logged on the way to one. Painting per line
+// survives the indentation go test adds to continuation lines.
+func Red(message string) string {
+	lines := strings.Split(message, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = red + line + reset
+		}
+	}
+	return strings.Join(lines, "\n")
+}

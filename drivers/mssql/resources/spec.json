@@ -1,0 +1,264 @@
+{
+    "type": "object",
+    "properties": {
+        "host": {
+            "type": "string",
+            "title": "MSSQL Host",
+            "description": "Database host address for connection"
+        },
+        "port": {
+            "type": "integer",
+            "title": "MSSQL Port",
+            "description": "Database server listening port",
+            "default": 1433
+        },
+        "database": {
+            "type": "string",
+            "title": "Database Name",
+            "description": "The name of the database to use for connection"
+        },
+        "username": {
+            "type": "string",
+            "title": "Username",
+            "description": "Username used to authenticate with the database"
+        },
+        "password": {
+            "type": "string",
+            "title": "Password",
+            "description": "Password for database authentication",
+            "format": "password",
+            "minLength": 1
+        },
+        "max_threads": {
+            "type": "integer",
+            "title": "Max Threads",
+            "description": "Max parallel threads for chunk snapshotting",
+            "default": 3
+        },
+        "retry_count": {
+            "type": "integer",
+            "title": "Retry Count",
+            "description": "Number of sync retry attempts using exponential backoff",
+            "default": 3
+        },
+        "ssl": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "title": "SSL Mode",
+                    "description": "Database connection SSL/encryption configuration",
+                    "default": "disable",
+                    "enum": [
+                        "require",
+                        "disable"
+                    ]
+                }
+            },
+            "required": [
+                "mode"
+            ]
+        },
+        "jdbc_url_params": {
+            "type": "object",
+            "title": "JDBC URL Parameters",
+            "description": "Additional connection parameters for the Go MSSQL driver",
+            "additionalProperties": true,
+            "default": {}
+        },
+        "manage_capture_instances": {
+            "type": "boolean",
+            "title": "Manage Capture Instances",
+            "description": "Automatically manage MSSQL CDC capture instances for schema evolution",
+            "default": false
+        },
+        "update_method": {
+            "title": "Update Method",
+            "description": "Capture inserts, updates, and deletes using CDC. Turn off to use full refresh or incremental mode.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "title": "CDC",
+                    "description": "Capture changes from SQL Server change tables",
+                    "properties": {
+                        "type": {
+                            "const": "CDC"
+                        }
+                    },
+                    "required": [
+                        "type"
+                    ],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "title": "Standalone",
+                    "description": "Read with full refresh or incremental queries only",
+                    "properties": {
+                        "type": {
+                            "const": "Standalone"
+                        }
+                    },
+                    "required": [
+                        "type"
+                    ],
+                    "additionalProperties": false
+                }
+            ]
+        },
+        "ssh_config": {
+            "title": "SSH Config",
+            "description": "OLake uses SSH to connect to the database.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "title": "No Tunnel",
+                    "properties": {
+                        "type": {
+                            "const": "no_tunnel"
+                        }
+                    },
+                    "required": [
+                        "type"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "title": "SSH Key Authentication",
+                    "properties": {
+                        "type": {
+                            "const": "ssh_key_authentication"
+                        },
+                        "host": {
+                            "type": "string",
+                            "title": "SSH Host",
+                            "description": "SSH host address"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "title": "SSH Port",
+                            "description": "Port number to connect to the SSH server"
+                        },
+                        "username": {
+                            "type": "string",
+                            "title": "SSH Username",
+                            "description": "Username to authenticate with the SSH server"
+                        },
+                        "private_key": {
+                            "type": "string",
+                            "title": "SSH Private Key",
+                            "description": "SSH private key to authenticate with the SSH server"
+                        },
+                        "passphrase": {
+                            "type": "string",
+                            "title": "SSH Passphrase",
+                            "description": "Passphrase to decrypt the encrypted SSH private key",
+                            "format": "password"
+                        }
+                    },
+                    "required": [
+                        "type",
+                        "host",
+                        "port",
+                        "username",
+                        "private_key"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "title": "SSH Password Authentication",
+                    "properties": {
+                        "type": {
+                            "const": "ssh_password_authentication"
+                        },
+                        "host": {
+                            "type": "string",
+                            "title": "SSH Host",
+                            "description": "SSH host address"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "title": "SSH Port",
+                            "description": "Port number to connect to the SSH server"
+                        },
+                        "username": {
+                            "type": "string",
+                            "title": "SSH Username",
+                            "description": "Username to authenticate with the SSH server"
+                        },
+                        "password": {
+                            "type": "string",
+                            "title": "SSH Password",
+                            "description": "Password to authenticate with the SSH server",
+                            "format": "password",
+                            "minLength": 1
+                        }
+                    },
+                    "required": [
+                        "type",
+                        "host",
+                        "port",
+                        "username",
+                        "password"
+                    ]
+                }
+            ]
+        }
+    },
+    "dependencies": {
+        "manage_capture_instances": {
+            "oneOf": [
+                {
+                    "properties": {
+                        "manage_capture_instances": {
+                            "const": true
+                        },
+                        "primary_config": {
+                            "type": "object",
+                            "title": "Primary Configuration",
+                            "description": "Connection details for the Always On primary replica. Required when the main connection targets a read-only secondary and capture instance management is enabled. Uses the same SSH tunnel as the main connection.",
+                            "properties": {
+                                "host": {
+                                    "type": "string",
+                                    "title": "Primary Host",
+                                    "description": "Host address of the primary replica"
+                                },
+                                "port": {
+                                    "type": "integer",
+                                    "title": "Primary Port",
+                                    "description": "Port number of the primary replica"
+                                },
+                                "username": {
+                                    "type": "string",
+                                    "title": "Primary Username",
+                                    "description": "Username for connecting to the primary replica"
+                                },
+                                "password": {
+                                    "type": "string",
+                                    "title": "Primary Password",
+                                    "description": "Password for connecting to the primary replica",
+                                    "format": "password",
+                                    "minLength": 1
+                                }
+                            }
+                        }
+                    }
+                },
+                {
+                    "properties": {
+                        "manage_capture_instances": {
+                            "const": false
+                        }
+                    }
+                }
+            ]
+        }
+    },
+    "required": [
+        "host",
+        "port",
+        "database",
+        "username",
+        "password"
+    ]
+}

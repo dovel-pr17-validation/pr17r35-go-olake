@@ -1,0 +1,103 @@
+package driver
+
+import (
+	"fmt"
+
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+)
+
+type Config struct {
+	Host             string            `json:"host"`
+	Port             int               `json:"port"`
+	Database         string            `json:"database"`
+	Username         string            `json:"username"`
+	Password         string            `json:"password"`
+	JDBCURLParams    map[string]string `json:"jdbc_url_params"`
+	SSLConfiguration *utils.SSLConfig  `json:"ssl"`
+	MaxThreads       int               `json:"max_threads"`
+	RetryCount       int               `json:"retry_count"`
+	SSHConfig        *utils.SSHConfig  `json:"ssh_config"`
+}
+
+func (c *Config) BuildDSN() string {
+	// Base DSN
+	dsn := fmt.Sprintf(
+		"HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s;",
+		c.Host,
+		c.Port,
+		c.Database,
+		c.Username,
+		c.Password,
+	)
+
+	// JDBC-style params if provided
+	for k, v := range c.JDBCURLParams {
+		dsn += fmt.Sprintf(";%s=%s", k, v)
+	}
+
+	// SSL if enabled
+	if c.SSLConfiguration != nil && c.SSLConfiguration.Mode != utils.SSLModeDisable {
+		dsn += ";SECURITY=SSL"
+		// TODO: Add support for more SSL params
+	}
+
+	return dsn
+}
+
+func (c *Config) BuildTunnelDSN(localPort int) string {
+	dsn := fmt.Sprintf(
+		"HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s;",
+		"localhost",
+		localPort,
+		c.Database,
+		c.Username,
+		c.Password,
+	)
+
+	for k, v := range c.JDBCURLParams {
+		dsn += fmt.Sprintf(";%s=%s", k, v)
+	}
+
+	return dsn
+}
+
+func (c *Config) Validate() error {
+	if c.Host == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeHostMissing, fmt.Errorf("empty host name"))
+	}
+
+	if c.Port <= 0 || c.Port > 65535 {
+		return errs.Precondition(errs.ConfigInvalid, codePortInvalid,
+			fmt.Errorf("invalid port number: must be between 1 and 65535"))
+	}
+
+	if c.Username == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeUsernameMissing, fmt.Errorf("username is required"))
+	}
+
+	if c.Database == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeDatabaseMissing,
+			fmt.Errorf("database name is required"))
+	}
+
+	if err := utils.ApplyMaxThreadsDefault(&c.MaxThreads); err != nil {
+		return err
+	}
+
+	if err := utils.ApplyRetryCountDefault(&c.RetryCount); err != nil {
+		return err
+	}
+
+	if c.SSLConfiguration == nil {
+		c.SSLConfiguration = &utils.SSLConfig{
+			Mode: "disable",
+		}
+	}
+
+	if err := c.SSLConfiguration.Validate(); err != nil {
+		return fmt.Errorf("invalid SSL configuration: %w", err)
+	}
+
+	return nil
+}

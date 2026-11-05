@@ -1,0 +1,233 @@
+package iceberg
+
+import (
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+	"github.com/datazip-inc/olake/utils/logger"
+)
+
+// CatalogType represents supported Iceberg catalog implementations
+type CatalogType string
+
+const (
+	// GlueCatalog is the AWS Glue catalog implementation
+	GlueCatalog CatalogType = "glue"
+	// JDBCCatalog is the JDBC catalog implementation
+	JDBCCatalog CatalogType = "jdbc"
+	// HiveCatalog is the Hive catalog implementation
+	HiveCatalog CatalogType = "hive"
+	// RestCatalog is the REST catalog implementation
+	RestCatalog CatalogType = "rest"
+)
+
+// TODO: add validation for each catalog properly
+type Config struct {
+	// S3-compatible Storage Configuration
+	Region             string `json:"aws_region,omitempty"`
+	AccessKey          string `json:"aws_access_key,omitempty"`
+	SecretKey          string `json:"aws_secret_key,omitempty"`
+	SessionToken       string `json:"aws_session_token,omitempty"`
+	ProfileName        string `json:"aws_profile,omitempty"`
+	NoIdentifierFields bool   `json:"no_identifier_fields"` // Needed to set true for Databricks Unity Catalog as it doesn't support identifier fields
+
+	// S3 endpoint for custom S3-compatible services (like MinIO)
+	S3Endpoint  string `json:"s3_endpoint,omitempty"`
+	S3UseSSL    bool   `json:"s3_use_ssl,omitempty"`    // Use HTTPS if true
+	S3PathStyle bool   `json:"s3_path_style,omitempty"` // Use path-style instead of virtual-hosted-style https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html
+
+	// Catalog Configuration
+	CatalogType CatalogType `json:"catalog_type,omitempty"`
+	CatalogName string      `json:"catalog_name,omitempty"`
+
+	// Glue catalog optional overrides
+	UseGlueAdditionalConfig bool   `json:"glue_additional_config,omitempty"`
+	GlueEndpoint            string `json:"glue_endpoint,omitempty"`
+	GlueAccessKey           string `json:"glue_access_key,omitempty"`
+	GlueSecretKey           string `json:"glue_secret_key,omitempty"`
+	GlueRegion              string `json:"glue_region,omitempty"`
+	GlueCatalogID           string `json:"glue_catalog_id,omitempty"`
+
+	// JDBC specific configuration
+	JDBCUrl      string `json:"jdbc_url,omitempty"`
+	JDBCUsername string `json:"jdbc_username,omitempty"`
+	JDBCPassword string `json:"jdbc_password,omitempty"`
+
+	// Hive specific configuration
+	HiveURI         string `json:"hive_uri,omitempty"`
+	HiveClients     int    `json:"hive_clients,omitempty"`
+	HiveSaslEnabled bool   `json:"hive_sasl_enabled,omitempty"`
+
+	// Iceberg Configuration
+	IcebergDatabase string `json:"iceberg_db,omitempty"`
+	IcebergS3Path   string `json:"iceberg_s3_path"`                // e.g. s3://bucket/path
+	JarPath         string `json:"sink_jar_path,omitempty"`        // Path to the Iceberg sink JAR
+	ServerHost      string `json:"sink_rpc_server_host,omitempty"` // gRPC server host
+
+	// Rest Catalog Configuration
+	RestCatalogURL    string `json:"rest_catalog_url,omitempty"`
+	RestSigningName   string `json:"rest_signing_name,omitempty"`
+	RestSigningRegion string `json:"rest_signing_region,omitempty"`
+	RestSigningV4     bool   `json:"rest_signing_v_4,omitempty"`
+	RestToken         string `json:"token,omitempty"`
+	RestOAuthURI      string `json:"oauth2_uri,omitempty"`
+	RestAuthType      string `json:"rest_auth_type,omitempty"`
+	RestScope         string `json:"scope,omitempty"`
+	RestCredential    string `json:"credential,omitempty"`
+
+	// GCP auth for GoogleAuthManager (e.g. BigLake). Inline SA key JSON;
+	GCPServiceAccountJSON string `json:"gcp_service_account_json,omitempty"`
+	GCPAuthScopes         string `json:"gcp_auth_scopes,omitempty"`
+	// Required by BigLake for request routing/billing (sent as the x-goog-user-project header).
+	GCPProjectID string `json:"gcp_project_id,omitempty"`
+
+	// Horizon
+	RESTAccessDelegation string `json:"rest_access_delegation,omitempty"`
+
+	UseArrowWrites bool `json:"arrow_writes,omitempty"`
+}
+
+func (c *Config) Validate() error {
+	if c.IcebergS3Path == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeCatalogConfigInvalid,
+			fmt.Errorf("s3_path is required"))
+	}
+
+	// Set defaults for catalog type
+	if c.CatalogType == "" {
+		c.CatalogType = GlueCatalog
+	}
+
+	if c.CatalogName == "" {
+		c.CatalogName = "olake_iceberg"
+	}
+	//S3 tables use SigV4 authentication and require signing name to be set to "s3tables"
+	if c.CatalogType == "s3tables" {
+		c.RestSigningV4 = true
+		c.RestSigningName = "s3tables"
+	}
+	//Unity Catalog doesn't support identifier fields (disable them)
+	if c.CatalogType == "unity" {
+		c.NoIdentifierFields = true
+	}
+	// BigLake requires GoogleAuthManager for authentication
+	if c.CatalogType == "biglake" {
+		c.RestAuthType = "org.apache.iceberg.gcp.auth.GoogleAuthManager"
+	}
+	// Horizon requires access delegation
+	if c.CatalogType == "horizon" {
+		c.RESTAccessDelegation = "vended-credentials"
+	}
+	c.RestAuthType = olakeAuthTypeToIcebergAuthType(c.RestAuthType)
+	if slices.Contains(constants.RESTCatalogs, string(c.CatalogType)) {
+		c.CatalogType = RestCatalog
+	}
+
+	// Default to path-style access for S3-compatible services
+	if c.S3Endpoint != "" {
+		c.S3PathStyle = true
+	}
+
+	// Validate S3 configuration
+	// Region can be picked up from environment or credentials file for AWS S3
+	if c.S3Endpoint == "" && c.Region == "" {
+		logger.Warn("aws_region not explicitly provided, will attempt to use region from environment variables or AWS config/credentials file")
+	}
+
+	// Log information about credentials for all S3 configurations
+	if c.AccessKey == "" && c.SecretKey == "" && c.ProfileName == "" {
+		if c.S3Endpoint == "" {
+			// AWS S3 scenario
+			logger.Info("AWS credentials not explicitly provided, will use default credential chain (environment variables, AWS config/credentials file, or instance metadata service)")
+		} else {
+			// Custom S3 endpoint scenario
+			logger.Info("S3 credentials not explicitly provided for custom endpoint. Ensure the service supports anonymous access or credentials are available through other means")
+		}
+	}
+
+	// Validate based on catalog type
+	switch c.CatalogType {
+	case JDBCCatalog:
+		if c.JDBCUrl == "" {
+			return errs.Precondition(errs.ConfigInvalid, codeCatalogConfigInvalid,
+				fmt.Errorf("jdbc_url is required when using JDBC catalog"))
+		}
+	case RestCatalog:
+		if c.RestCatalogURL == "" {
+			return errs.Precondition(errs.ConfigInvalid, codeCatalogConfigInvalid,
+				fmt.Errorf("rest_catalog_url is required when using REST catalog"))
+		}
+	case HiveCatalog:
+		if c.HiveURI == "" {
+			return errs.Precondition(errs.ConfigInvalid, codeCatalogConfigInvalid,
+				fmt.Errorf("hive_uri is required when using Hive catalog"))
+		}
+	case GlueCatalog:
+		// No additional validation required for Glue catalog
+	default:
+		return errs.Precondition(errs.ConfigInvalid, codeUnsupportedCatalogType,
+			fmt.Errorf("unsupported catalog_type: %s", c.CatalogType))
+	}
+
+	if c.JarPath == "" {
+		// Set JarPath based on file existence in two possible locations
+		execDir, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current directory for searching jar file: %w", err)
+		}
+
+		// Remove /drivers/* from execDir if present
+		if idx := strings.LastIndex(execDir, "/drivers/"); idx != -1 {
+			execDir = execDir[:idx]
+		}
+
+		// First, check if the JAR exists in the base directory
+		baseJarPath := fmt.Sprintf("%s/olake-iceberg-java-writer.jar", execDir)
+		if err := utils.CheckIfFilesExists(baseJarPath); err == nil {
+			// JAR file exists in base directory
+			logger.Infof("Iceberg JAR file found in base directory: %s", baseJarPath)
+			c.JarPath = baseJarPath
+		} else {
+			// Otherwise, look in the target directory
+			targetJarPath := fmt.Sprintf("%s/destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar", execDir)
+			if err := utils.CheckIfFilesExists(targetJarPath); err == nil {
+				logger.Infof("Iceberg JAR file found in target directory: %s", targetJarPath)
+				c.JarPath = targetJarPath
+			} else {
+				return errs.Precondition(errs.InternalError, codeJarNotFound,
+					fmt.Errorf("Iceberg JAR file not found in any of the expected locations: %s, %s. Go to destination/iceberg/olake-iceberg-java-writer/target/ directory and run mvn clean package -DskipTests",
+						baseJarPath, targetJarPath))
+			}
+		}
+	}
+	if c.ServerHost == "" {
+		c.ServerHost = "localhost"
+	}
+	return utils.Validate(c)
+}
+
+func olakeAuthTypeToIcebergAuthType(authType string) string {
+	switch strings.ToLower(strings.TrimSpace(authType)) {
+	case "oauth2", "oauth2 u2m", "oauth2 m2m", "token", "token federation",
+		"personal access token (pat)", "pat", "external oauth",
+		"key-pair authentication", "programmatic access token (pat)":
+		return "oauth2"
+	case "none":
+		return "none"
+	case "sigv4":
+		return "sigv4"
+	case "google", "gcp":
+		return "google"
+	default:
+		if strings.Contains(authType, ".") && !strings.Contains(authType, " ") {
+			return authType
+		}
+		logger.Warnf("unmapped rest_auth_type %q. Iceberg rest.auth.type omitted", authType)
+		return ""
+	}
+}

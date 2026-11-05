@@ -1,0 +1,210 @@
+package types
+
+import (
+	"slices"
+
+	"github.com/goccy/go-json"
+	"github.com/spf13/viper"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
+)
+
+// StreamID is the fully qualified identity of a source stream, carried as separate fields for namespace and table name
+type StreamID struct {
+	Namespace string // schema / database / owner
+	Name      string // table / collection / topic
+}
+
+// String returns the canonical "namespace.name" identifier, matching Stream.ID(). It is used for logging only.
+func (s StreamID) String() string {
+	return utils.StreamIdentifier(s.Name, s.Namespace)
+}
+
+// Output Stream Object for dsynk
+type Stream struct {
+	// Name of the Stream
+	Name string `json:"name,omitempty"`
+	// Namespace of the Stream, or Database it belongs to
+	// helps in identifying collections with same name in different database
+	Namespace string `json:"namespace,omitempty"`
+	// Possible Schema of the Stream
+	Schema *TypeSchema `json:"type_schema,omitempty"`
+	// Supported sync modes from driver for the respective Stream
+	SupportedSyncModes *Set[SyncMode] `json:"supported_sync_modes,omitempty"`
+	// Delete formats every target query engine can read, cheapest first. Discover without
+	// target engines is unconstrained and lists every format OLake can write. Absent only
+	// on catalogs written before target query engines existed.
+	AvailableUpdateTypes []UpdateType `json:"available_update_types,omitempty"`
+	// Primary key if available
+	SourceDefinedPrimaryKey *Set[string] `json:"source_defined_primary_key,omitempty"`
+	// Available cursor fields supported by driver
+	AvailableCursorFields *Set[string] `json:"available_cursor_fields,omitempty"`
+	// Input of JSON Schema from Client to be parsed by driver
+	AdditionalProperties string `json:"additional_properties,omitempty"`
+	// Cursor field to be used for incremental sync
+	CursorField string `json:"cursor_field,omitempty"`
+	// Mode being used for syncing data
+	SyncMode SyncMode `json:"sync_mode,omitempty"`
+	// Normalized Destination Database and Table used as default values for destination database and table
+	DestinationDatabase string `json:"destination_database,omitempty"`
+	DestinationTable    string `json:"destination_table,omitempty"`
+	// Columns that can be selected for this stream, including OLake columns.
+	// Populated on discover from type_schema (source columns + OLake columns).
+	SelectableColumns []string `json:"selectable_columns,omitempty"`
+	// Default stream properties (connector level)
+	DefaultStreamProperties *DefaultStreamProperties `json:"default_stream_properties,omitempty"`
+}
+
+type DefaultStreamProperties struct {
+	Normalization bool       `json:"normalization"`
+	AppendMode    bool       `json:"append_mode"`
+	UpdateType    UpdateType `json:"update_type"`
+}
+
+func NewStream(name, namespace string, sourceDatabase *string) *Stream {
+	DestDatabase, DestTable := utils.GenerateDestinationDetails(namespace, name, sourceDatabase)
+	return &Stream{
+		Name:                    name,
+		Namespace:               namespace,
+		SupportedSyncModes:      NewSet[SyncMode](),
+		SourceDefinedPrimaryKey: NewSet[string](),
+		AvailableCursorFields:   NewSet[string](),
+		Schema:                  NewTypeSchema(),
+		DestinationDatabase:     DestDatabase,
+		DestinationTable:        DestTable,
+	}
+}
+
+// TODO: Refactor ID to return struct of namespace and name, similar to what is done in GetStreamNames
+func (s *Stream) ID() string {
+	return utils.StreamIdentifier(s.Name, s.Namespace)
+}
+
+func (s *Stream) WithSyncMode(modes ...SyncMode) *Stream {
+	for _, mode := range modes {
+		s.SupportedSyncModes.Insert(mode)
+	}
+
+	return s
+}
+
+func (s *Stream) WithPrimaryKey(keys ...string) *Stream {
+	for _, key := range keys {
+		s.SourceDefinedPrimaryKey.Insert(key)
+	}
+
+	return s
+}
+
+func (s *Stream) WithCursorField(columns ...string) *Stream {
+	for _, column := range columns {
+		s.AvailableCursorFields.Insert(column)
+	}
+
+	return s
+}
+
+func (s *Stream) WithSchema(schema *TypeSchema) *Stream {
+	s.Schema = schema
+	return s
+}
+
+// RefreshSelectableColumns sets selectable_columns from the current schema,
+// including OLake columns.
+func (s *Stream) RefreshSelectableColumns() {
+	if s == nil || s.Schema == nil {
+		return
+	}
+	s.SelectableColumns = s.Schema.ColumnNames()
+}
+
+// Add or Update Column in Stream Type Schema
+func (s *Stream) UpsertField(column string, typ DataType, nullable bool, isOlakeColumn bool) {
+	types := []DataType{typ}
+	if nullable {
+		types = append(types, Null)
+	}
+
+	s.Schema.AddTypes(column, isOlakeColumn, types...)
+}
+
+func (s *Stream) Wrap(_ int) *ConfiguredStream {
+	return &ConfiguredStream{
+		Stream: s,
+	}
+}
+
+// MarshalJSON writes Set fields in sorted order so catalog files are stable across runs.
+func (s *Stream) MarshalJSON() ([]byte, error) {
+	type Alias Stream // alias to avoid recursive call
+	sortedStrings := func(set *Set[string]) *[]string {
+		if set == nil {
+			return nil
+		}
+		arr := set.Array()
+		slices.Sort(arr)
+		return &arr
+	}
+	return json.Marshal(&struct {
+		*Alias
+		AvailableCursorFields   *[]string `json:"available_cursor_fields,omitempty"`
+		SourceDefinedPrimaryKey *[]string `json:"source_defined_primary_key,omitempty"`
+	}{
+		Alias:                   (*Alias)(s),
+		AvailableCursorFields:   sortedStrings(s.AvailableCursorFields),
+		SourceDefinedPrimaryKey: sortedStrings(s.SourceDefinedPrimaryKey),
+	})
+}
+
+func (s *Stream) UnmarshalJSON(data []byte) error {
+	// Define a type alias to avoid recursion
+	type Alias Stream
+
+	// Create a temporary alias value to unmarshal into
+	var temp Alias
+
+	temp.AvailableCursorFields = NewSet[string]()
+	temp.SourceDefinedPrimaryKey = NewSet[string]()
+	temp.SupportedSyncModes = NewSet[SyncMode]()
+
+	err := json.Unmarshal(data, &temp)
+	if err != nil {
+		return err
+	}
+
+	*s = Stream(temp)
+	return nil
+}
+
+func StreamsToMap(streams ...*Stream) map[string]*Stream {
+	output := make(map[string]*Stream)
+	for _, stream := range streams {
+		output[stream.ID()] = stream
+	}
+
+	return output
+}
+
+// LogCatalog merges the fresh discover result with the prior catalog, then writes
+// available_streams.json, selected_streams.json, and streams.json from that one merge.
+// oldCatalog is the prior catalog (legacy streams.json already converted); nil means first-ever discover.
+func LogCatalog(streams []*Stream, oldCatalog *Catalog, engines []QueryEngine) {
+	message := Message{
+		Type:    CatalogMessage,
+		Catalog: GetWrappedCatalog(streams, engines),
+	}
+	logger.Info(message)
+
+	merged := mergeCatalogs(oldCatalog, message.Catalog, engines)
+
+	if err := merged.writeSplitFiles(); err != nil {
+		logger.Fatal(err)
+	}
+
+	streamsFilePath := viper.GetString(constants.StreamsPath)
+	if err := toLegacyCatalog(merged).WriteToFile(streamsFilePath); err != nil {
+		logger.Fatalf("failed to create streams file: %s", err)
+	}
+}

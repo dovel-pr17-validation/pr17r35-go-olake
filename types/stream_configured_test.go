@@ -1,0 +1,841 @@
+package types
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestConfiguredStream_GetFilter(t *testing.T) {
+	tests := []struct {
+		name        string
+		filter      string
+		expected    FilterConfig
+		expectError bool
+	}{
+		{
+			name:     "empty filter",
+			filter:   "",
+			expected: FilterConfig{},
+		},
+		{
+			name:   "simple unquoted column",
+			filter: "status = active",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "status", Operator: "=", Value: "active"},
+				},
+			},
+		},
+		{
+			name:   "double quoted column name",
+			filter: `"user-id" > 5`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "user-id", Operator: ">", Value: "5"},
+				},
+			},
+		},
+		{
+			name:   "unquoted column with underscores",
+			filter: "user_id != 0 and user_name = john_doe",
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "user_id", Operator: "!=", Value: "0"},
+					{Column: "user_name", Operator: "=", Value: "john_doe"},
+				},
+			},
+		},
+		{
+			name:   "double quoted column with spaces",
+			filter: `"column name" != "some value"`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "column name", Operator: "!=", Value: `"some value"`},
+				},
+			},
+		},
+		{
+			name:   "two conditions with AND - mixed quotes",
+			filter: `"user-id" > 5 and status = "active"`,
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "user-id", Operator: ">", Value: "5"},
+					{Column: "status", Operator: "=", Value: `"active"`},
+				},
+			},
+		},
+		{
+			name:   "all operators test",
+			filter: "age >= 18",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "age", Operator: ">=", Value: "18"},
+				},
+			},
+		},
+		{
+			name:        "invalid filter format",
+			filter:      "invalid filter format",
+			expectError: true,
+		},
+		{
+			name:        "unclosed quotes",
+			filter:      `"unclosed > 5`,
+			expectError: true,
+		},
+		{
+			name:        "too many conditions",
+			filter:      "a > 5 and b < 10 and c = 3",
+			expectError: true,
+		},
+		{
+			name:   "compact comparison without spaces",
+			filter: "a>b",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "b"},
+				},
+			},
+		},
+		{
+			name:   "mixed quoted and unquoted columns with logical operator",
+			filter: `"a" >b and a < c`,
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "b"},
+					{Column: "a", Operator: "<", Value: "c"},
+				},
+			},
+		},
+		{
+			name:        "invalid operator sequence",
+			filter:      `"a" >>>= b`,
+			expectError: true,
+		},
+		{
+			name:   "negative number value",
+			filter: "temperature < -10",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "temperature", Operator: "<", Value: "-10"},
+				},
+			},
+		},
+		{
+			name:   "decimal number with leading dot",
+			filter: "ratio >= .5",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "ratio", Operator: ">=", Value: ".5"},
+				},
+			},
+		},
+		{
+			name:        "decimal number with trailing dot invalid",
+			filter:      "count = 5.",
+			expectError: true,
+		},
+		{
+			name:   "quoted empty string value",
+			filter: `name != ""`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "name", Operator: "!=", Value: `""`},
+				},
+			},
+		},
+		{
+			name:   "lowercase and operator",
+			filter: "a > 1 and b < 2",
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "1"},
+					{Column: "b", Operator: "<", Value: "2"},
+				},
+			},
+		},
+		{
+			name:   "lowercase or operator",
+			filter: "x = 1 or y = 2",
+			expected: FilterConfig{
+				LogicalOperator: "or",
+				Conditions: []FilterCondition{
+					{Column: "x", Operator: "=", Value: "1"},
+					{Column: "y", Operator: "=", Value: "2"},
+				},
+			},
+		},
+		{
+			name:   "column with numbers",
+			filter: "column123 = value456",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "column123", Operator: "=", Value: "value456"},
+				},
+			},
+		},
+		{
+			name:   "excessive whitespace",
+			filter: "  a   >   b   and   c   <   d  ",
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "b"},
+					{Column: "c", Operator: "<", Value: "d"},
+				},
+			},
+		},
+		{
+			name:   "no spaces around operators",
+			filter: "a>5and b<10",
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "5"},
+					{Column: "b", Operator: "<", Value: "10"},
+				},
+			},
+		},
+		{
+			name:   "quoted value with spaces",
+			filter: `description = "hello world"`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "description", Operator: "=", Value: `"hello world"`},
+				},
+			},
+		},
+		{
+			name:   "all different operators in sequence",
+			filter: "a = 1 and b != 2",
+			expected: FilterConfig{
+				LogicalOperator: "and",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: "=", Value: "1"},
+					{Column: "b", Operator: "!=", Value: "2"},
+				},
+			},
+		},
+		{
+			name:   "greater than or equal with decimal",
+			filter: "price >= 99.99",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "price", Operator: ">=", Value: "99.99"},
+				},
+			},
+		},
+		{
+			name:   "less than or equal with integer",
+			filter: "age <= 100",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "age", Operator: "<=", Value: "100"},
+				},
+			},
+		},
+		{
+			name:   "quoted column with dot notation",
+			filter: `"user.email" = "test@example.com"`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "user.email", Operator: "=", Value: `"test@example.com"`},
+				},
+			},
+		},
+		{
+			name:   "uppercase AND operator",
+			filter: "a > 1 AND b < 2",
+			expected: FilterConfig{
+				LogicalOperator: "AND",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "1"},
+					{Column: "b", Operator: "<", Value: "2"},
+				},
+			},
+		},
+		{
+			name:   "uppercase OR operator",
+			filter: "a > 1 OR b < 2",
+			expected: FilterConfig{
+				LogicalOperator: "OR",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "1"},
+					{Column: "b", Operator: "<", Value: "2"},
+				},
+			},
+		},
+		{
+			name:        "missing operator",
+			filter:      "column value",
+			expectError: true,
+		},
+		{
+			name:        "only column name",
+			filter:      "column",
+			expectError: true,
+		},
+		{
+			name:        "only operator",
+			filter:      ">",
+			expectError: true,
+		},
+		{
+			name:        "missing value",
+			filter:      "column >",
+			expectError: true,
+		},
+		{
+			name:        "missing column",
+			filter:      "> value",
+			expectError: true,
+		},
+		{
+			name:        "mixed logical operators",
+			filter:      "a = 1 and b = 2 or c = 3",
+			expectError: true,
+		},
+		{
+			name:        "invalid operator combination",
+			filter:      "a >< b",
+			expectError: true,
+		},
+		{
+			name:        "double equals invalid",
+			filter:      "a == b",
+			expectError: true,
+		},
+		{
+			name:        "sql style not equal unsupported",
+			filter:      "a <> b",
+			expectError: true,
+		},
+		{
+			name:        "logical operator without second condition",
+			filter:      "a = 1 and",
+			expectError: true,
+		},
+		{
+			name:        "logical operator without first condition",
+			filter:      "and b = 2",
+			expectError: true,
+		},
+		{
+			name:        "special characters in unquoted column",
+			filter:      "user-name = john",
+			expectError: true,
+		},
+		{
+			name:        "space in unquoted column",
+			filter:      "user name = john",
+			expectError: true,
+		},
+		{
+			name:        "dot in unquoted column",
+			filter:      "user.name = john",
+			expectError: true,
+		},
+		{
+			name:        "multiple equals invalid",
+			filter:      "a === b",
+			expectError: true,
+		},
+		{
+			name:        "positive number with plus sign",
+			filter:      "score > +10",
+			expectError: true,
+		},
+		{
+			name:   "scientific notation",
+			filter: "temperature >= 1e3",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "temperature", Operator: ">=", Value: "1e3"},
+				},
+			},
+		},
+		{
+			name:   "NULL literal",
+			filter: "status = NULL",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "status", Operator: "=", Value: "NULL"},
+				},
+			},
+		},
+		{
+			name:   "empty quoted column",
+			filter: `"" = value`,
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: "", Operator: "=", Value: "value"},
+				},
+			},
+		},
+		{
+			name:        "escaped quotes unsupported",
+			filter:      `"col\"name" = "val\"ue"`,
+			expectError: true,
+		},
+		{
+			name:        "non ascii column unquoted",
+			filter:      "café = oui",
+			expectError: true,
+		},
+		{
+			name:        "trailing garbage",
+			filter:      "a = b junk",
+			expectError: true,
+		},
+		{
+			name:   "very long column name",
+			filter: strings.Repeat("longcol", 100) + " = 1",
+			expected: FilterConfig{
+				Conditions: []FilterCondition{
+					{Column: strings.Repeat("longcol", 100), Operator: "=", Value: "1"},
+				},
+			},
+		},
+		{
+			name:        "logical operator with trailing comma",
+			filter:      "a > 1   and   , b < 2",
+			expectError: true,
+		},
+		{
+			name:   "mixed case logical operator",
+			filter: "a > 1 And b < 2",
+			expected: FilterConfig{
+				LogicalOperator: "And",
+				Conditions: []FilterCondition{
+					{Column: "a", Operator: ">", Value: "1"},
+					{Column: "b", Operator: "<", Value: "2"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := &ConfiguredStream{
+				StreamMetadata: StreamMetadata{
+					Filter: tt.filter,
+				},
+			}
+
+			result, _, err := cs.GetFilter()
+
+			if tt.expectError {
+				assert.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.expected.LogicalOperator, result.LogicalOperator)
+			require.Len(t, result.Conditions, len(tt.expected.Conditions))
+
+			for i := range tt.expected.Conditions {
+				assert.Equal(t, tt.expected.Conditions[i], result.Conditions[i])
+			}
+		})
+	}
+}
+
+func TestConfiguredStream_GetSyncMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		want     SyncMode
+	}{
+		{
+			name:   "legacy format: reads from stream when no metadata",
+			stream: &Stream{SyncMode: SyncMode("cdc")},
+			want:   SyncMode("cdc"),
+		},
+		{
+			name:     "metadata-only: reads from selected_streams",
+			stream:   &Stream{},
+			metadata: StreamMetadata{SyncMode: SyncMode("cdc")},
+			want:     SyncMode("cdc"),
+		},
+		{
+			// selected_streams wins when both are set
+			name:     "selected_streams wins over streams[]",
+			stream:   &Stream{SyncMode: SyncMode("full_refresh")},
+			metadata: StreamMetadata{SyncMode: SyncMode("cdc")},
+			want:     SyncMode("cdc"),
+		},
+		{
+			// Both empty → empty SyncMode
+			name:   "both empty returns empty",
+			stream: &Stream{},
+			want:   SyncMode(""),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			assert.Equal(t, tt.want, s.GetSyncMode())
+		})
+	}
+}
+
+func TestConfiguredStream_Cursor(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		wantPri  string
+		wantSec  string
+	}{
+		{
+			name:    "legacy format: reads from stream when no metadata",
+			stream:  &Stream{CursorField: "updated_at"},
+			wantPri: "updated_at",
+			wantSec: "",
+		},
+		{
+			name:     "metadata-only: reads from selected_streams",
+			stream:   &Stream{},
+			metadata: StreamMetadata{CursorField: "updated_at"},
+			wantPri:  "updated_at",
+			wantSec:  "",
+		},
+		{
+			// selected_streams wins when both are set
+			name:     "selected_streams wins over streams[]",
+			stream:   &Stream{CursorField: "created_at"},
+			metadata: StreamMetadata{CursorField: "updated_at"},
+			wantPri:  "updated_at",
+		},
+		{
+			name:     "secondary cursor parsed from colon-separated metadata cursor",
+			stream:   &Stream{},
+			metadata: StreamMetadata{CursorField: "updated_at:id"},
+			wantPri:  "updated_at",
+			wantSec:  "id",
+		},
+		{
+			name:    "both empty returns empty",
+			stream:  &Stream{},
+			wantPri: "",
+			wantSec: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			primary, secondary := s.Cursor()
+			assert.Equal(t, tt.wantPri, primary)
+			assert.Equal(t, tt.wantSec, secondary)
+		})
+	}
+}
+
+func TestConfiguredStream_GetDestinationDatabase(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		want     string
+	}{
+		{
+			name:   "legacy format: reads from stream when no metadata",
+			stream: &Stream{Name: "users", Namespace: "public", DestinationDatabase: "legacy_db"},
+			want:   "legacy_db",
+		},
+		{
+			name:     "metadata-only: reads from selected_streams",
+			stream:   &Stream{Name: "users", Namespace: "public"},
+			metadata: StreamMetadata{DestinationDatabase: "new_db"},
+			want:     "new_db",
+		},
+		{
+			// selected_streams wins when both are set
+			name:     "selected_streams wins over streams[]",
+			stream:   &Stream{Name: "users", Namespace: "public", DestinationDatabase: "legacy_db"},
+			metadata: StreamMetadata{DestinationDatabase: "new_db"},
+			want:     "new_db",
+		},
+		{
+			name:   "falls back to namespace when all empty",
+			stream: &Stream{Name: "users", Namespace: "public"},
+			want:   "public",
+		},
+		{
+			name:   "icebergDB used when stream and metadata are empty",
+			stream: &Stream{Name: "users", Namespace: "public"},
+			want:   "iceberg_db",
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			var icebergDB *string
+			if i == len(tests)-1 { // last test uses icebergDB
+				db := "iceberg_db"
+				icebergDB = &db
+			}
+			assert.Equal(t, tt.want, s.GetDestinationDatabase(icebergDB))
+		})
+	}
+}
+
+func TestConfiguredStream_GetDestinationTable(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		want     string
+	}{
+		{
+			name:   "legacy format: reads from stream when no metadata",
+			stream: &Stream{Name: "users", DestinationTable: "legacy_table"},
+			want:   "legacy_table",
+		},
+		{
+			name:     "metadata-only: reads from selected_streams",
+			stream:   &Stream{Name: "users"},
+			metadata: StreamMetadata{DestinationTable: "new_table"},
+			want:     "new_table",
+		},
+		{
+			// selected_streams wins when both are set
+			name:     "selected_streams wins over streams[]",
+			stream:   &Stream{Name: "users", DestinationTable: "legacy_table"},
+			metadata: StreamMetadata{DestinationTable: "new_table"},
+			want:     "new_table",
+		},
+		{
+			name:   "falls back to stream name when all empty",
+			stream: &Stream{Name: "users"},
+			want:   "users",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			assert.Equal(t, tt.want, s.GetDestinationTable())
+		})
+	}
+}
+
+func TestConfiguredStream_NormalizationEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		want     bool
+	}{
+		{
+			name:     "explicit true in metadata",
+			stream:   &Stream{},
+			metadata: StreamMetadata{Normalization: new(true)},
+			want:     true,
+		},
+		{
+			name:     "explicit false in metadata",
+			stream:   &Stream{},
+			metadata: StreamMetadata{Normalization: new(false)},
+			want:     false,
+		},
+		{
+			name:     "nil metadata falls back to DSP (true)",
+			stream:   &Stream{DefaultStreamProperties: &DefaultStreamProperties{Normalization: true}},
+			metadata: StreamMetadata{},
+			want:     true,
+		},
+		{
+			name:   "nil metadata returns false",
+			stream: &Stream{},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			assert.Equal(t, tt.want, s.NormalizationEnabled())
+		})
+	}
+}
+
+func TestConfiguredStream_AppendModeEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		stream   *Stream
+		metadata StreamMetadata
+		want     bool
+	}{
+		{
+			name:     "explicit true in metadata",
+			metadata: StreamMetadata{AppendMode: new(true)},
+			stream:   &Stream{},
+			want:     true,
+		},
+		{
+			name:     "explicit false in metadata",
+			metadata: StreamMetadata{AppendMode: new(false)},
+			stream:   &Stream{},
+			want:     false,
+		},
+		{
+			name:     "nil metadata falls back to DSP (true)",
+			stream:   &Stream{DefaultStreamProperties: &DefaultStreamProperties{AppendMode: true}},
+			metadata: StreamMetadata{},
+			want:     true,
+		},
+		{
+			// explicit false in metadata wins over DSP=true
+			name:     "explicit false in metadata wins over DSP true",
+			stream:   &Stream{DefaultStreamProperties: &DefaultStreamProperties{AppendMode: true}},
+			metadata: StreamMetadata{AppendMode: new(false)},
+			want:     false,
+		},
+		{
+			name:   "nil metadata and nil DSP returns false (zero value)",
+			stream: &Stream{},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{Stream: tt.stream, StreamMetadata: tt.metadata}
+			assert.Equal(t, tt.want, s.AppendModeEnabled())
+		})
+	}
+}
+
+// An omitted update_type follows the stream's default_stream_properties; an explicit one wins, and
+// catalogs that predate both fall back to equality. A blank one means discover cleared it, so the
+// user must choose before sync is valid.
+func TestConfiguredStreamUpdateTypeResolution(t *testing.T) {
+	stream := func(defaultType UpdateType) *Stream {
+		return &Stream{
+			Name:                    "users",
+			AvailableUpdateTypes:    []UpdateType{UpdateTypeEquality, UpdateTypePosition},
+			DefaultStreamProperties: &DefaultStreamProperties{UpdateType: defaultType},
+		}
+	}
+
+	testCases := []struct {
+		name        string
+		stream      *Stream
+		selected    *string
+		expected    UpdateType
+		expectedErr string
+	}{
+		{"omitted follows the stream default", stream(UpdateTypePosition), nil, UpdateTypePosition, ""},
+		{"explicit value wins over the default", stream(UpdateTypePosition), new("eq"), UpdateTypeEquality, ""},
+		{"omitted without a default falls back to equality", &Stream{Name: "users"}, nil, UpdateTypeEquality, ""},
+		{"cleared blank must be chosen", stream(UpdateTypePosition), new(""), UpdateTypeEquality, "update mode not set"},
+		{"cleared blank without available types is equality", &Stream{Name: "users"}, new(""), UpdateTypeEquality, ""},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			configured := &ConfiguredStream{Stream: tc.stream, StreamMetadata: StreamMetadata{UpdateType: tc.selected}}
+			assert.Equal(t, tc.expected, configured.GetUpdateType())
+			err := configured.ValidateUpdateType(Iceberg)
+			if tc.expectedErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.expectedErr)
+			}
+		})
+	}
+}
+
+// Parquet writes no deletes, so the delete format is never checked there, even with
+// append_mode off; other destinations keep validating it.
+func TestValidateUpdateTypeByDestination(t *testing.T) {
+	stream := &Stream{Name: "users", AvailableUpdateTypes: []UpdateType{UpdateTypePosition}}
+
+	testCases := []struct {
+		name            string
+		destinationType DestinationType
+		updateType      *string
+		appendMode      *bool
+		expectedErr     string
+	}{
+		{"parquet ignores a cleared update type", Parquet, new(""), new(false), ""},
+		{"parquet ignores an unreadable update type", Parquet, new(string(UpdateTypeEquality)), new(false), ""},
+		{"iceberg rejects a cleared update type", Iceberg, new(""), new(false), "update mode not set"},
+		{"iceberg rejects an unreadable update type", Iceberg, new(string(UpdateTypeEquality)), new(false), "eq"},
+		{"unknown destination rejects a cleared update type", "", new(""), new(false), "update mode not set"},
+		{"iceberg append mode skips the check", Iceberg, new(""), new(true), ""},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			configured := &ConfiguredStream{Stream: stream, StreamMetadata: StreamMetadata{UpdateType: tc.updateType, AppendMode: tc.appendMode}}
+			err := configured.ValidateUpdateType(tc.destinationType)
+			if tc.expectedErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.expectedErr)
+			}
+		})
+	}
+}
+
+func TestConfiguredStream_ResolveUpsertOp(t *testing.T) {
+	tests := []struct {
+		name string
+		meta StreamMetadata
+		want bool
+	}{
+		{
+			name: "append mode is not upsert",
+			meta: StreamMetadata{AppendMode: new(true)},
+			want: false,
+		},
+		{
+			name: "false append_mode without dedup keys stays append",
+			meta: StreamMetadata{AppendMode: new(false)},
+			want: false,
+		},
+		{
+			name: "only kafka key is upsert",
+			meta: StreamMetadata{AppendMode: new(false), DedupKeys: []string{"_kafka_key"}},
+			want: true,
+		},
+		{
+			name: "message column dedup is upsert",
+			meta: StreamMetadata{AppendMode: new(false), DedupKeys: []string{"id"}},
+			want: true,
+		},
+		{
+			name: "kafka key + column is upsert",
+			meta: StreamMetadata{AppendMode: new(false), DedupKeys: []string{"_kafka_key", "id"}},
+			want: true,
+		},
+		{
+			name: "zero metadata stays append",
+			meta: StreamMetadata{},
+			want: false,
+		},
+		{
+			name: "append_mode true with leftover dedup keys stays append",
+			meta: StreamMetadata{AppendMode: new(true), DedupKeys: []string{"id"}},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ConfiguredStream{StreamMetadata: tt.meta}
+			assert.Equal(t, tt.want, s.ResolveUpsertOp())
+		})
+	}
+}

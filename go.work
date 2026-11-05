@@ -1,0 +1,15 @@
+go 1.26.10
+
+toolchain go1.26.10
+
+use (
+	.
+	./drivers/db2
+	./drivers/kafka
+	./drivers/mongodb
+	./drivers/mssql
+	./drivers/mysql
+	./drivers/oracle
+	./drivers/postgres
+	./drivers/s3
+)

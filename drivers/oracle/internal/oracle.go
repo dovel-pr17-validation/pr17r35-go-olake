@@ -1,0 +1,238 @@
+package driver
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/pkg/jdbc"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
+	"github.com/jmoiron/sqlx"
+	go_ora "github.com/sijms/go-ora/v2"
+	"golang.org/x/crypto/ssh"
+)
+
+type Oracle struct {
+	config     *Config
+	client     *sqlx.DB
+	state      *types.State
+	CDCSupport bool
+	sshClient  *ssh.Client
+}
+
+func (o *Oracle) Setup(ctx context.Context) error {
+	err := o.config.Validate()
+	if err != nil {
+		return fmt.Errorf("failed to validate config: %w", err)
+	}
+
+	if o.config.SSHConfig != nil && o.config.SSHConfig.Host != "" {
+		logger.Info("Found SSH Configuration")
+		o.sshClient, err = o.config.SSHConfig.SetupSSHConnection()
+		if err != nil {
+			return fmt.Errorf("failed to setup SSH connection: %w", err)
+		}
+	}
+
+	var client *sqlx.DB
+	if o.sshClient != nil {
+		logger.Info("Connecting to Oracle via SSH tunnel")
+
+		oracleCfg, err := go_ora.ParseConfig(o.config.connectionString())
+		if err != nil {
+			return fmt.Errorf("failed to parse oracle connection string: %w", err)
+		}
+
+		// Allows oracle driver to use the SSH client to connect to the database
+		oracleCfg.RegisterDial(func(ctx context.Context, _, addr string) (net.Conn, error) {
+			conn, err := o.sshClient.DialContext(ctx, "tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return utils.ConnWithCustomDeadlineSupport(conn)
+		})
+
+		go_ora.RegisterConnConfig(oracleCfg)
+
+		client, err = sqlx.Open("oracle", "")
+		if err != nil {
+			return fmt.Errorf("failed to open tunneled database connection: %w", err)
+		}
+	} else {
+		// TODO: Add support for more encryption options provided in OracleDB
+		client, err = sqlx.Open("oracle", o.config.connectionString())
+		if err != nil {
+			return fmt.Errorf("failed to open database connection: %w", err)
+		}
+	}
+
+	// Set connection pool size
+	client.SetMaxOpenConns(o.config.MaxThreads)
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := client.PingContext(ctx); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	o.client = client
+	return nil
+}
+
+func (o *Oracle) GetConfigRef() abstract.Config {
+	o.config = &Config{}
+	return o.config
+}
+
+func (o *Oracle) Spec() any {
+	return Config{}
+}
+
+// Close closes the database connection
+func (o *Oracle) Close() error {
+	if o.client != nil {
+		if err := o.client.Close(); err != nil {
+			logger.Errorf("failed to close database connection with Oracle: %s", err)
+		}
+	}
+
+	if o.sshClient != nil {
+		if err := o.sshClient.Close(); err != nil {
+			logger.Errorf("failed to close SSH client: %s", err)
+		}
+	}
+
+	return nil
+}
+
+// Type returns the database type
+func (o *Oracle) Type() string {
+	return string(constants.Oracle)
+}
+
+// MaxConnections returns the maximum number of connections
+func (o *Oracle) MaxConnections() int {
+	return o.config.MaxThreads
+}
+
+// MaxRetries returns the maximum number of retries
+func (o *Oracle) MaxRetries() int {
+	return o.config.RetryCount
+}
+
+// GetStreamNames returns a list of available tables/streams
+func (o *Oracle) GetStreamNames(ctx context.Context) ([]types.StreamID, error) {
+	logger.Infof("Starting discover for Oracle database")
+	// TODO: Add support for custom schema names
+	query := jdbc.OracleTableDiscoveryQuery()
+	rows, err := o.client.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tables: %w", err)
+	}
+	defer rows.Close()
+
+	var streamNames []types.StreamID
+	for rows.Next() {
+		var owner, tableName string
+		if err := rows.Scan(&owner, &tableName); err != nil {
+			return nil, fmt.Errorf("failed to scan table: %w", err)
+		}
+		streamNames = append(streamNames, types.StreamID{Namespace: owner, Name: tableName})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tables: %w", err)
+	}
+
+	return streamNames, nil
+}
+
+// ProduceSchema generates the schema for a given stream
+func (o *Oracle) ProduceSchema(ctx context.Context, streamName types.StreamID) (*types.Stream, error) {
+	logger.Infof("producing type schema for stream [%s]", streamName)
+	schemaName, tableName := streamName.Namespace, streamName.Name
+	stream := types.NewStream(tableName, schemaName, nil)
+
+	// Get column information
+	query := jdbc.OracleTableDetailsQuery(schemaName, tableName)
+	rows, err := o.client.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query column information: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var columnName, dataType, isNullable string
+		var dataPrecision, dataScale sql.NullInt64
+		if err := rows.Scan(&columnName, &dataType, &isNullable, &dataPrecision, &dataScale); err != nil {
+			return nil, fmt.Errorf("failed to scan column: %w", err)
+		}
+		stream.WithCursorField(columnName)
+		var datatype types.DataType
+		if val, found := reformatOracleDatatype(dataType, dataPrecision, dataScale); found {
+			datatype = val
+		} else {
+			logger.Warnf("Unsupported Oracle type '%s' for column '%s.%s', defaulting to String", dataType, streamName, columnName)
+			datatype = types.String
+		}
+
+		stream.UpsertField(columnName, datatype, strings.EqualFold("Y", isNullable), false)
+	}
+
+	query = jdbc.OraclePrimaryKeyColummsQuery(schemaName, tableName)
+	pkRows, err := o.client.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query primary key information: %w", err)
+	}
+	defer pkRows.Close()
+
+	for pkRows.Next() {
+		var columnName string
+		if err := pkRows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("failed to scan primary key column: %w", err)
+		}
+		stream.WithPrimaryKey(columnName)
+	}
+
+	stream.WithSyncMode(types.FULLREFRESH, types.INCREMENTAL)
+	return stream, pkRows.Err()
+}
+
+// tzNaiveOracleTypes are Oracle column types that store only wall-clock time with no timezone.
+// go-ora attaches dbServerTimeZone when decoding all three via the same code path:
+//
+//	DATE (12)          → "DATE"         — Oracle DATE columns
+//	TimeStampDTY (180) → "TimeStampDTY" — TIMESTAMP columns in regular SELECT results
+//	TODO: Add support for TIMESTAMP (187)    → "TIMESTAMP"    — TIMESTAMP in RETURNING INTO / PL/SQL OUT params
+//
+// Strip the attached offset to preserve wall-clock digits consistently as UTC.
+var tzNaiveOracleTypes = map[string]bool{
+	"date":         true,
+	"timestampdty": true,
+}
+
+func (o *Oracle) dataTypeConverter(value interface{}, columnType string) (interface{}, error) {
+	if value == nil {
+		return nil, typeutils.ErrNullValue
+	}
+	olakeType := typeutils.ExtractAndMapColumnType(columnType, oracleTypeToDataTypes)
+	result, err := typeutils.ReformatValue(olakeType, value)
+	if err != nil {
+		return result, err
+	}
+	// Strip the session-timezone offset that go-ora attaches to timezone-naive columns.
+	if tzNaiveOracleTypes[strings.ToLower(columnType)] {
+		if t, ok := result.(time.Time); ok {
+			result = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+		}
+	}
+	return result, nil
+}

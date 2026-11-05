@@ -1,0 +1,659 @@
+package utils
+
+import (
+	"context"
+
+	//nolint:gosec // G401: md5 used for non-crypto hashing
+	"crypto/md5"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"os"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/utils/errs"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/goccy/go-json"
+	"github.com/oklog/ulid"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+)
+
+var (
+	ulidMutex = sync.Mutex{}
+	entropy   = ulid.Monotonic(rand.Reader, 0)
+)
+
+func Absolute[T int | int8 | int16 | int32 | int64 | float32 | float64](value T) T {
+	if value < 0 {
+		return -value
+	}
+
+	return value
+}
+
+// IsValidSubcommand checks if the passed subcommand is supported by the parent command
+func IsValidSubcommand(available []*cobra.Command, sub string) bool {
+	for _, s := range available {
+		if sub == s.Use || sub == s.CalledAs() {
+			return true
+		}
+	}
+	return false
+}
+
+func ExistInArray[T ~string | int | int8 | int16 | int32 | int64 | float32 | float64](set []T, value T) bool {
+	_, found := ArrayContains(set, func(elem T) bool {
+		return elem == value
+	})
+
+	return found
+}
+
+func ArrayContains[T any](set []T, match func(elem T) bool) (int, bool) {
+	for idx, elem := range set {
+		if match(elem) {
+			return idx, true
+		}
+	}
+
+	return -1, false
+}
+
+// returns cond ? a ; b (note: it is not function ternary)
+func Ternary(cond bool, a, b any) any {
+	if cond {
+		return a
+	}
+	return b
+}
+
+// HumanDuration renders a duration for display in the largest unit it reaches, rounded to one
+// decimal: "45 seconds", "12.5 minutes", "1 hour", "7.5 days". Days is the largest unit.
+func HumanDuration(d time.Duration) string {
+	unit, n := "second", d.Seconds()
+	switch {
+	case d >= 24*time.Hour:
+		unit, n = "day", d.Hours()/24
+	case d >= time.Hour:
+		unit, n = "hour", d.Hours()
+	case d >= time.Minute:
+		unit, n = "minute", d.Minutes()
+	}
+	n = math.Round(n*10) / 10
+	s := strconv.FormatFloat(n, 'f', -1, 64) + " " + unit
+	if n != 1 {
+		s += "s"
+	}
+	return s
+}
+
+// return the average of the given values.
+func Average[T int | int8 | int16 | int32 | int64 | float32 | float64](values []T) float64 {
+	if len(values) == 0 {
+		return 0.0
+	}
+
+	var sum float64
+	for _, v := range values {
+		sum += float64(v)
+	}
+	return sum / float64(len(values))
+}
+
+func ForEach[T any](set []T, action func(elem T) error) error {
+	for _, elem := range set {
+		err := action(elem)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Unmarshal serializes and deserializes any from into the object
+// return error if occurred
+func Unmarshal(from, object any) error {
+	reformatted := reformatInnerMaps(from)
+	b, err := json.Marshal(reformatted)
+	if err != nil {
+		return fmt.Errorf("error marshaling object: %s", err)
+	}
+	err = json.Unmarshal(b, object)
+	if err != nil {
+		return fmt.Errorf("error unmarshalling from object: %s", err)
+	}
+
+	return nil
+}
+
+func IsInstance(val any, typ reflect.Kind) bool {
+	return reflect.ValueOf(val).Kind() == typ
+}
+
+// reformatInnerMaps converts all map[any]any into map[string]any
+// because json.Marshal doesn't support map[any]any (supports only string keys)
+// but viper produces map[any]any for inner maps
+// return recursively converted all map[interface]any to map[string]any
+func reformatInnerMaps(valueI any) any {
+	switch value := valueI.(type) {
+	case []any:
+		for i, subValue := range value {
+			value[i] = reformatInnerMaps(subValue)
+		}
+		return value
+	case map[any]any:
+		newMap := make(map[string]any, len(value))
+		for k, subValue := range value {
+			newMap[fmt.Sprint(k)] = reformatInnerMaps(subValue)
+		}
+		return newMap
+	case map[string]any:
+		for k, subValue := range value {
+			value[k] = reformatInnerMaps(subValue)
+		}
+		return value
+	default:
+		return valueI
+	}
+}
+
+func CheckIfFilesExists(files ...string) error {
+	for _, file := range files {
+		// Check if the file or directory exists
+		_, err := os.Stat(file)
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s does not exist: %s", file, err)
+		}
+
+		_, err = os.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %s", file, err)
+		}
+	}
+
+	return nil
+}
+
+// func ReadFile(file string) any {
+// 	content, _ := ReadFileE(file)
+
+// 	return content
+// }
+
+func UnmarshalFile(file string, dest any, credsFile bool) error {
+	// Classified here because nothing further up can tell a missing file from an unreadable
+	// one from a wrong encryption key.
+	if err := CheckIfFilesExists(file); err != nil {
+		return errs.Precondition(errs.ConfigInvalid, "config.file_unreadable", err)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return errs.Precondition(errs.ConfigInvalid, "config.file_unreadable",
+			fmt.Errorf("file not found : %w", err))
+	}
+	decryptedJSON := data
+	// Use the encryption package to decrypt JSON
+	if credsFile && viper.GetString(constants.EncryptionKey) != "" {
+		dConfig, err := Decrypt(string(data))
+		if err != nil {
+			// A wrong or missing --encryption-key, not a malformed config.
+			return errs.Precondition(errs.ConfigDecryptFailed, "config.decrypt_failed",
+				fmt.Errorf("failed to decrypt config file[%s]: %w", file, err))
+		}
+		decryptedJSON = []byte(dConfig)
+	}
+	err = json.Unmarshal(decryptedJSON, dest)
+	if err != nil {
+		return errs.Precondition(errs.ConfigInvalid, "config.malformed_json",
+			fmt.Errorf("failed to unmarshal file[%s]: %w", file, err))
+	}
+	return nil
+}
+
+// UpdateMethodType returns the "type" of an update_method config object, so a driver can tell
+// CDC from standard replication. It returns "" when the field is absent, which is how configs
+// saved before the driver had an update_method read: the driver decides what to do with that.
+func UpdateMethodType(updateMethod any) string {
+	if updateMethod == nil {
+		return ""
+	}
+	var method struct {
+		Type string `json:"type"`
+	}
+	if err := Unmarshal(updateMethod, &method); err != nil {
+		return ""
+	}
+	return method.Type
+}
+
+func IsOfType(object any, decidingKey string) (bool, error) {
+	objectMap := make(map[string]any)
+	if err := Unmarshal(object, &objectMap); err != nil {
+		return false, err
+	}
+
+	if _, found := objectMap[decidingKey]; found {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func StreamIdentifier(name, namespace string) string {
+	if namespace != "" {
+		return fmt.Sprintf("%s.%s", namespace, name)
+	}
+
+	return name
+}
+
+func IsSubset[T comparable](setArray, subsetArray []T) bool {
+	set := make(map[T]bool)
+	for _, item := range setArray {
+		set[item] = true
+	}
+
+	for _, item := range subsetArray {
+		if _, found := set[item]; !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func MaxDate(v1, v2 time.Time) time.Time {
+	if v1.After(v2) {
+		return v1
+	}
+
+	return v2
+}
+
+func ULID() string {
+	return genULID(time.Now())
+}
+
+func genULID(t time.Time) string {
+	ulidMutex.Lock()
+	defer ulidMutex.Unlock()
+	newUlid, err := ulid.New(ulid.Timestamp(t), entropy)
+	if err != nil {
+		logger.Fatalf("failed to generate ulid: %s", err)
+	}
+	return newUlid.String()
+}
+
+// Returns a timestamped
+func TimestampedFileName(extension string) string {
+	now := time.Now().UTC()
+	return fmt.Sprintf("%d-%02d-%02d_%02d-%02d-%02d_%s.%s", now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), genULID(now), extension)
+}
+
+func IsJSON(str string) bool {
+	var js json.RawMessage
+	return json.Unmarshal([]byte(str), &js) == nil
+}
+
+// keyString renders one primary key value for the olake id. Byte values (binary keys) are hex encoded
+func keyString(v any) string {
+	switch {
+	case !IsBinarySupported():
+		return fmt.Sprint(v)
+	default:
+		if b, ok := v.([]byte); ok {
+			return hex.EncodeToString(b)
+		}
+		return fmt.Sprint(v)
+	}
+}
+
+// GetKeysHash returns md5 hashsum of concatenated map values (sort keys before)
+func GetKeysHash(m map[string]interface{}, keys ...string) string {
+	// if single primary key is present use as it is
+	if len(keys) == 1 {
+		if _, ok := m[keys[0]]; ok {
+			return keyString(m[keys[0]])
+		}
+	}
+
+	// If no primary key is present, the entire record is hashed to generate the olakeID.
+	if len(keys) == 0 {
+		return GetHash(m)
+	}
+	sort.Strings(keys)
+
+	var str strings.Builder
+	for _, k := range keys {
+		str.WriteString(keyString(m[k]))
+		str.WriteRune('|')
+	}
+	//nolint:gosec // G115: overflow not applicable for md5.Sum input size
+	return fmt.Sprintf("%x", md5.Sum([]byte(str.String())))
+}
+
+// GetHash returns GetKeysHash result with keys from m
+func GetHash(m map[string]interface{}) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	return GetKeysHash(m, keys...)
+}
+
+func AddConstantToInterface(val interface{}, increment int) (interface{}, error) {
+	switch v := val.(type) {
+	case int:
+		return v + increment, nil
+	case int64:
+		return v + int64(increment), nil
+	case float32:
+		return v + float32(increment), nil
+	case float64:
+		return v + float64(increment), nil
+	default:
+		return nil, fmt.Errorf("failed to add contant values to interface, unsupported type %T", val)
+	}
+}
+
+func ConvertToString(value interface{}) string {
+	switch v := value.(type) {
+	case []byte:
+		return string(v) // Convert byte slice to string
+	case string:
+		return v // Already a string
+	default:
+		return fmt.Sprintf("%v", v) // Fallback
+	}
+}
+
+// HexEncode converts binary data to a SQL hex literal string (e.g. "0x00001a0024").
+func HexEncode(b []byte) string {
+	return "0x" + hex.EncodeToString(b)
+}
+
+func ComputeConfigHash(srcPath, destPath string) string {
+	if srcPath == "" || destPath == "" {
+		// no config or no destination → no meaningful hash
+		return ""
+	}
+	a, err := os.ReadFile(srcPath)
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(destPath)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(append(a, b...))
+	return hex.EncodeToString(sum[:])
+}
+
+func NormalizedEqual(strune1, strune2 string) bool {
+	normalize := func(s string) (string, error) {
+		// Slice out exactly from the first '{' to the last '}'
+		start := strings.IndexRune(s, '{')
+		end := strings.LastIndex(s, "}")
+		if start < 0 || end < 0 || start > end {
+			return "", fmt.Errorf("no valid JSON object found")
+		}
+		core := s[start : end+1]
+		// remove whitespace
+		core = strings.ReplaceAll(core, " ", "")
+		core = strings.ReplaceAll(core, "\n", "")
+		core = strings.ReplaceAll(core, "\t", "")
+		return core, nil
+	}
+
+	c1, err := normalize(strune1)
+	if err != nil {
+		return false
+	}
+	c2, err := normalize(strune2)
+	if err != nil {
+		return false
+	}
+
+	rune1 := []rune(c1)
+	rune2 := []rune(c2)
+	if len(rune1) != len(rune2) {
+		return false
+	}
+	sort.Slice(rune1, func(i, j int) bool { return rune1[i] < rune1[j] })
+	sort.Slice(rune2, func(i, j int) bool { return rune2[i] < rune2[j] })
+	return string(rune1) == string(rune2)
+}
+
+// Reformat makes all keys to lower case and replaces all special symbols with '_'
+func Reformat(key string) string {
+	key = strings.ToLower(key)
+	var result strings.Builder
+	for _, symbol := range key {
+		if IsLetterOrNumber(symbol) {
+			result.WriteByte(byte(symbol))
+		} else {
+			result.WriteRune('_')
+		}
+	}
+	return result.String()
+}
+
+// IsLetterOrNumber returns true if input symbol is:
+//
+//	A - Z: 65-90
+//	a - z: 97-122
+func IsLetterOrNumber(symbol int32) bool {
+	return ('a' <= symbol && symbol <= 'z') ||
+		('A' <= symbol && symbol <= 'Z') ||
+		('0' <= symbol && symbol <= '9')
+}
+
+// GenerateDestinationDetails creates the default Iceberg database and table names.
+// It combines prefix, source database, and namespace into a proper DB name.
+func GenerateDestinationDetails(namespace, name string, sourceDatabase *string) (string, string) {
+	parts := []string{}
+
+	// Add destination database prefix if available
+	if prefix := viper.GetString(constants.DestinationDatabasePrefix); prefix != "" {
+		parts = append(parts, Reformat(prefix))
+	}
+
+	// Add source database if provided
+	if sourceDatabase != nil && *sourceDatabase != "" {
+		parts = append(parts, Reformat(*sourceDatabase))
+	}
+
+	// Join prefix + source database
+	dbName := strings.Join(parts, "_")
+
+	// Append namespace if provided
+	if namespace != "" {
+		dbName = fmt.Sprintf("%s:%s", dbName, Reformat(namespace))
+	}
+
+	// Final table name is always reformatted
+	return dbName, Reformat(name)
+}
+
+// splitAndTrim splits a comma-separated string and trims whitespace
+func SplitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+// maxTypeParamDigits bounds a type parameter to 9 digits, which always fits an int, even a 32-bit one.
+const maxTypeParamDigits = 9
+
+// IsType reports whether dataType is an instance of pattern, a type whose non-negative integer
+// parameters are written %d (fixed_binary(%d), fixed[%d]), with exactly numParams of them, and
+// returns the parameters in order. dataType must be spelled exactly as the pattern renders.
+func IsType[T ~string](dataType, pattern T, numParams int) (bool, []int) {
+	var scratch [4]int
+	params := scratch[:0]
+	if numParams > len(scratch) {
+		params = make([]int, 0, numParams)
+	}
+	params = params[:numParams]
+	if !ScanType(dataType, pattern, params) {
+		return false, nil
+	}
+	return true, append([]int(nil), params...)
+}
+
+// ScanType is IsType writing the parameters into params, whose length is the number expected, so
+// a per-value caller can scan into an array on its stack without allocating.
+// For example:
+//
+//	var width [1]int
+//	ScanType("fixed_binary(16)", "fixed_binary(%d)", width[:]) // true, width == [16]
+//	ScanType("fixed[16]", "fixed_binary(%d)", width[:])        // false, another family
+//
+//	var precisionScale [2]int
+//	ScanType("decimal(9,2)", "decimal(%d,%d)", precisionScale[:])  // true, precisionScale == [9 2]
+//	ScanType("decimal(9, 2)", "decimal(%d,%d)", precisionScale[:]) // false, the pattern has no space
+func ScanType[T ~string](dataType, pattern T, params []int) bool {
+	s, p := string(dataType), string(pattern)
+	found := 0
+	for {
+		literal, rest, hasParam := strings.Cut(p, "%d")
+		var matched bool
+		if s, matched = strings.CutPrefix(s, literal); !matched {
+			return false
+		}
+		if !hasParam {
+			return s == "" && found == len(params)
+		}
+		if found == len(params) {
+			return false
+		}
+		param, digits := 0, 0
+		for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
+			param = param*10 + int(s[digits]-'0')
+			digits++
+		}
+		if digits == 0 || digits > maxTypeParamDigits {
+			return false
+		}
+		params[found] = param
+		found++
+		s, p = s[digits:], rest
+	}
+}
+
+// RetryWithSkip calls f once and retries up to maxRetries more times on error,
+// using linear backoff ((retry+1)*sleep) between each attempt.
+// shouldRetry is called on each non-nil error: return true to keep retrying, false to surface the
+// error immediately without waiting. A nil shouldRetry retries all errors.
+func RetryWithSkip(ctx context.Context, maxRetries int, sleep time.Duration, shouldRetry func(error) bool, f func(ctx context.Context) error) (err error) {
+	for cur := range maxRetries + 1 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err = f(ctx); err == nil {
+				return nil
+			}
+		}
+
+		if shouldRetry != nil && !shouldRetry(err) {
+			return err
+		}
+
+		if cur != maxRetries {
+			backoff := time.Duration(cur+1) * sleep
+			logger.Infof("retry attempt[%d/%d], retrying after %.2f seconds due to err: %s", cur+1, maxRetries, backoff.Seconds(), err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
+	return err
+}
+
+// RetryOnBackoff invokes f once and retries it up to attempts times with a backoff
+// sleep between attempts (i.e. at most attempts+1 total invocations).
+func RetryOnBackoff(ctx context.Context, attempts int, sleep time.Duration, f func(ctx context.Context) error) (err error) {
+	attempts = attempts + 1
+	for cur := range attempts {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err = f(ctx); err == nil {
+				return nil
+			}
+		}
+
+		// check if error is non retryable
+		if strings.Contains(err.Error(), constants.ErrNonRetryable.Error()) {
+			return err
+		}
+
+		if attempts > 1 && cur != attempts-1 {
+			logger.Infof("retry attempt[%d], retrying after %.2f seconds due to err: %s", cur+1, sleep.Seconds(), err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleep):
+				sleep = sleep * 2
+			}
+		}
+	}
+
+	return err
+}
+
+// ExtractColumnName extracts a column name from regex capture groups.
+// It returns the first non-empty group from the provided groups.
+// This is used when parsing filter expressions where column names can be:
+//   - Quoted (for special characters): "user-name", "email@domain", "column.with.dots"
+//   - Unquoted (for normal identifiers): age, status, count
+//
+// Example usage:
+//
+// For filter: \"user-name\" = \"John\"
+// matches[1] = "user-name" (quoted column), matches[2] = "" (unquoted column)
+//
+//	columnName := ExtractColumnName(matches[1], matches[2]) // Returns: "user-name"
+//
+// For filter: age > 18
+// matches[1] = "" (quoted column), matches[2] = "age" (unquoted column)
+//
+//	columnName := ExtractColumnName(matches[1], matches[2]) // Returns: "age"
+func ExtractColumnName(groups ...string) string {
+	for _, group := range groups {
+		if group != "" {
+			return group
+		}
+	}
+	return ""
+}
+
+// ComputeSamplePercent returns the TABLESAMPLE / SAMPLE BLOCK percentage to use
+// for chunk boundary estimation. The result is clamped to
+// [constants.SamplePercentMin, constants.SamplePercentMax] so callers never
+// request a near-zero or near-full scan regardless of row-count estimates.
+// TODO: Improve the sampling percentage formula for huge tables and near to consistent chunks.
+func ComputeSamplePercent(approxRowCount, numberOfChunks int64) float64 {
+	minSampleRows := numberOfChunks * constants.SampleRowsPerChunkMultiplier
+	samplingPercentage := float64(minSampleRows) / float64(approxRowCount) * 100.0
+	return max(constants.SamplePercentMin, min(constants.SamplePercentMax, samplingPercentage))
+}

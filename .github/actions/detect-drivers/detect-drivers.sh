@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+
+known=$(make -s print.drivers)
+
+if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ "$GITHUB_BASE_REF" = master ]; then
+  selected="$known"
+else
+  changed=$(gh api --paginate \
+    "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+    --jq '.[].filename')
+  selected=""
+  for file in $changed; do
+    case "$file" in
+      drivers/*/*|tests/*/*) d=${file#*/}; d=${d%%/*} ;;
+      *) d="" ;;
+    esac
+    case " $known " in *" $d "*) selected="$selected $d"; continue ;; esac
+    selected="$known"
+    break
+  done
+fi
+
+drivers=$(printf '%s\n' $selected | sort -u | jq -Rc '[., inputs] | map(select(. != ""))')
+echo "drivers=$drivers" >> "$GITHUB_OUTPUT"
+echo "Affected drivers: $drivers"
+
+title_case() {
+  jq -c 'map({key: ., value: ((.[0:1] | ascii_upcase) + .[1:])}) | from_entries'
+}
+
+labels=$(printf '%s' "$drivers" | title_case)
+echo "driver-labels=$labels" >> "$GITHUB_OUTPUT"

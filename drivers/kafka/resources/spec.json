@@ -1,0 +1,328 @@
+{
+    "type": "object",
+    "properties": {
+        "bootstrap_servers": {
+            "type": "string",
+            "title": "Bootstrap Servers",
+            "description": "Comma-separated list of Kafka bootstrap servers (e.g., broker1:9092,broker2:9092)"
+        },
+        "protocol": {
+            "title": "Security Protocol Configuration",
+            "description": "Kafka security settings",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "title": "PLAINTEXT",
+                    "properties": {
+                        "security_protocol": {
+                            "const": "PLAINTEXT"
+                        }
+                    },
+                    "required": [
+                        "security_protocol"
+                    ]
+                },
+                {
+                    "title": "SASL_PLAINTEXT",
+                    "type": "object",
+                    "properties": {
+                        "security_protocol": {
+                            "const": "SASL_PLAINTEXT"
+                        },
+                        "sasl_mechanism": {
+                            "type": "string",
+                            "title": "SASL Mechanism",
+                            "description": "Authentication mechanism for SASL",
+                            "enum": [
+                                "PLAIN",
+                                "SCRAM-SHA-512"
+                            ],
+                            "default": "PLAIN"
+                        },
+                        "sasl_jaas_config": {
+                            "type": "string",
+                            "title": "SASL JAAS Config",
+                            "description": "JAAS configuration string (e.g., org.apache.kafka.common.security.plain.PlainLoginModule required username=\"user\" password=\"pass\";)",
+                            "minLength": 1
+                        }
+                    },
+                    "required": [
+                        "security_protocol",
+                        "sasl_mechanism",
+                        "sasl_jaas_config"
+                    ]
+                },
+                {
+                    "title": "SASL_SSL",
+                    "type": "object",
+                    "properties": {
+                        "security_protocol": {
+                            "const": "SASL_SSL"
+                        },
+                        "sasl_mechanism": {
+                            "type": "string",
+                            "title": "SASL Mechanism",
+                            "description": "Authentication mechanism for SASL over SSL",
+                            "enum": [
+                                "PLAIN",
+                                "SCRAM-SHA-512"
+                            ],
+                            "default": "PLAIN"
+                        },
+                        "sasl_jaas_config": {
+                            "type": "string",
+                            "title": "SASL JAAS Config",
+                            "description": "JAAS configuration string (e.g., org.apache.kafka.common.security.plain.PlainLoginModule required username=\"user\" password=\"pass\";)",
+                            "minLength": 1
+                        },
+                        "tls_skip_verify": {
+                            "type": "boolean",
+                            "title": "Skip TLS Verification",
+                            "description": "Skip TLS certificate verification (not recommended for production)",
+                            "default": false
+                        },
+                        "ssl": {
+                            "type": "object",
+                            "title": "SSL Configuration",
+                            "description": "SSL/TLS certificate configuration (optional for AWS MSK)",
+                            "properties": {
+                                "server_ca": {
+                                    "type": "string",
+                                    "title": "CA Certificate",
+                                    "description": "CA certificate content in PEM format",
+                                    "multiline": true
+                                },
+                                "client_cert": {
+                                    "type": "string",
+                                    "title": "Client Certificate",
+                                    "description": "Client certificate content for mTLS authentication in PEM format",
+                                    "multiline": true
+                                },
+                                "client_key": {
+                                    "type": "string",
+                                    "title": "Client Key",
+                                    "description": "Client private key content for mTLS authentication in PEM format",
+                                    "multiline": true
+                                }
+                            }
+                        }
+                    },
+                    "required": [
+                        "security_protocol",
+                        "sasl_mechanism",
+                        "sasl_jaas_config"
+                    ]
+                },
+                {
+                    "title": "SSL",
+                    "type": "object",
+                    "properties": {
+                        "security_protocol": {
+                            "const": "SSL"
+                        },
+                        "tls_skip_verify": {
+                            "type": "boolean",
+                            "title": "Skip TLS Verification",
+                            "description": "Skip TLS certificate verification (not recommended for production)",
+                            "default": false
+                        },
+                        "ssl": {
+                            "type": "object",
+                            "title": "SSL Configuration",
+                            "description": "SSL/TLS certificate configuration (all fields optional for AWS MSK)",
+                            "properties": {
+                                "server_ca": {
+                                    "type": "string",
+                                    "title": "CA Certificate",
+                                    "description": "CA certificate content in PEM format",
+                                    "multiline": true
+                                },
+                                "client_cert": {
+                                    "type": "string",
+                                    "title": "Client Certificate",
+                                    "description": "Client certificate content for mTLS authentication in PEM format",
+                                    "multiline": true
+                                },
+                                "client_key": {
+                                    "type": "string",
+                                    "title": "Client Key",
+                                    "description": "Client private key content for mTLS authentication in PEM format",
+                                    "multiline": true
+                                }
+                            }
+                        }
+                    },
+                    "required": [
+                        "security_protocol"
+                    ]
+                }
+            ]
+        },
+        "consumer_group_id": {
+            "type": "string",
+            "title": "Consumer Group ID",
+            "description": "Kafka consumer group ID (optional)"
+        },
+        "topic_pattern": {
+            "type": "string",
+            "title": "Topic Pattern",
+            "description": "Perl-style regular expression to filter topics by name (optional)",
+            "default": ""
+        },
+        "max_threads": {
+            "type": "integer",
+            "title": "Max Threads",
+            "description": "Maximum number of parallel processing threads",
+            "minimum": 0,
+            "default": 3
+        },
+        "backoff_retry_count": {
+            "type": "integer",
+            "title": "Retry Count",
+            "description": "Number of retry attempts with exponential backoff",
+            "minimum": 0,
+            "default": 3
+        },
+        "threads_equal_total_partitions": {
+            "type": "boolean",
+            "title": "Threads Equal Total Partitions",
+            "description": "If true, number of threads will be set equal to total partitions (overrides max_threads)",
+            "default": true
+        },
+        "use_schema_registry": {
+            "type": "boolean",
+            "title": "Use Schema Registry",
+            "description": "Enable Confluent Schema Registry for Avro message deserialization",
+            "default": false
+        }
+    },
+    "required": [
+        "bootstrap_servers",
+        "protocol"
+    ],
+    "dependencies": {
+        "use_schema_registry": {
+            "oneOf": [
+                {
+                    "properties": {
+                        "use_schema_registry": {
+                            "const": false
+                        }
+                    }
+                },
+                {
+                    "properties": {
+                        "use_schema_registry": {
+                            "const": true
+                        },
+                        "schema_registry": {
+                            "type": "object",
+                            "title": " ",
+                            "properties": {
+                                "endpoint": {
+                                    "type": "string",
+                                    "title": "Schema Registry Endpoint",
+                                    "description": "Schema Registry URL (e.g., http://localhost:8081)",
+                                    "minLength": 1
+                                },
+                                "auth_type": {
+                                    "type": "string",
+                                    "title": "Authentication Type",
+                                    "enum": [
+                                        "none",
+                                        "basic",
+                                        "bearer"
+                                    ],
+                                    "enumNames": [
+                                        "No Authentication",
+                                        "Username & Password",
+                                        "Bearer Token"
+                                    ],
+                                    "default": "none"
+                                }
+                            },
+                            "required": [
+                                "endpoint",
+                                "auth_type"
+                            ],
+                            "dependencies": {
+                                "auth_type": {
+                                    "oneOf": [
+                                        {
+                                            "properties": {
+                                                "auth_type": {
+                                                    "const": "none"
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "properties": {
+                                                "auth_type": {
+                                                    "const": "basic"
+                                                },
+                                                "username": {
+                                                    "type": "string",
+                                                    "title": "Username",
+                                                    "description": "Username for Schema Registry authentication",
+                                                    "minLength": 1
+                                                },
+                                                "password": {
+                                                    "type": "string",
+                                                    "title": "Password",
+                                                    "description": "Password for Schema Registry authentication",
+                                                    "minLength": 1
+                                                }
+                                            },
+                                            "required": [
+                                                "username",
+                                                "password"
+                                            ]
+                                        },
+                                        {
+                                            "properties": {
+                                                "auth_type": {
+                                                    "const": "bearer"
+                                                },
+                                                "bearer_token": {
+                                                    "type": "string",
+                                                    "title": "Bearer Token",
+                                                    "description": "Bearer token for Schema Registry authentication",
+                                                    "minLength": 1
+                                                }
+                                            },
+                                            "required": [
+                                                "bearer_token"
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "required": [
+                        "schema_registry"
+                    ]
+                }
+            ]
+        }
+    },
+    "allOf": [
+        {
+            "if": {
+                "properties": {
+                    "threads_equal_total_partitions": {
+                        "const": true
+                    }
+                }
+            },
+            "then": {
+                "properties": {
+                    "max_threads": {
+                        "readOnly": true,
+                        "description": "Disabled because threads_equal_total_partitions is true — threads will match total partitions automatically."
+                    }
+                }
+            }
+        }
+    ]
+}

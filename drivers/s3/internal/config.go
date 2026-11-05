@@ -1,0 +1,197 @@
+package driver
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/datazip-inc/olake/drivers/s3/internal/pkg/parser"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/errs"
+)
+
+// FileFormat represents the format of files in S3
+type FileFormat string
+
+const (
+	FormatCSV     FileFormat = "csv"
+	FormatJSON    FileFormat = "json"
+	FormatParquet FileFormat = "parquet"
+	FormatXML     FileFormat = "xml"
+)
+
+var supportedFileFormats = []FileFormat{FormatCSV, FormatJSON, FormatParquet, FormatXML}
+
+var formatExtensions = map[FileFormat][]string{
+	FormatCSV:     {".csv"},
+	FormatJSON:    {".json", ".jsonl"},
+	FormatParquet: {".parquet"},
+	FormatXML:     {".xml"},
+}
+
+// CompressionType represents the compression type of files
+type CompressionType string
+
+const (
+	CompressionNone CompressionType = "none"
+	CompressionGzip CompressionType = "gzip"
+	CompressionZip  CompressionType = "zip"
+)
+
+// Config represents the configuration for S3 source connector
+type Config struct {
+	// ===== AWS Connection Configuration =====
+	BucketName      string `json:"bucket_name"`
+	Region          string `json:"region"`
+	PathPrefix      string `json:"path_prefix"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+	Endpoint        string `json:"endpoint"` // Optional: for S3-compatible services like MinIO
+
+	// ===== File Format Configuration =====
+	FileFormat  FileFormat      `json:"file_format"`
+	Compression CompressionType `json:"compression"`
+
+	// ===== Performance & Filtering Configuration =====
+	MaxThreads  int    `json:"max_threads"`  // Number of concurrent file processors
+	RetryCount  int    `json:"retry_count"`  // Number of retries for failed operations
+	FilePattern string `json:"file_pattern"` // Regex pattern to filter files (optional)
+
+	// ===== Stream Grouping Configuration =====
+	// Stream grouping is always enabled at level 1 (first folder after path_prefix)
+	// StreamPattern for custom grouping can be added in Phase 2
+	StreamPattern string `json:"stream_pattern"` // Regex pattern for custom grouping (Phase 2)
+
+	// ===== Format-Specific Parser Configurations =====
+	CSV     *parser.CSVConfig     `json:"csv,omitempty"`
+	JSON    *parser.JSONConfig    `json:"json,omitempty"`
+	Parquet *parser.ParquetConfig `json:"parquet,omitempty"`
+	XML     *parser.XMLConfig     `json:"xml,omitempty"`
+}
+
+// Validate validates the S3 configuration
+func (c *Config) Validate() error {
+	// Validate bucket name
+	if c.BucketName == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeBucketNameMissing,
+			fmt.Errorf("bucket_name is required"))
+	}
+
+	// Validate region (only if not using custom endpoint)
+	if c.Endpoint == "" && c.Region == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeRegionMissing,
+			fmt.Errorf("region is required when not using custom endpoint"))
+	}
+
+	// Validate credentials - both must be provided together or omitted together
+	// If omitted, the driver will fall back to default credential chain (IAM roles, env vars, etc.)
+	if (c.AccessKeyID != "" && c.SecretAccessKey == "") || (c.AccessKeyID == "" && c.SecretAccessKey != "") {
+		return errs.Precondition(errs.ConfigInvalid, codeCredentialsIncomplete,
+			fmt.Errorf("access_key_id and secret_access_key must be provided together or both omitted (for IAM role authentication)"))
+	}
+
+	// Validate file format
+	if c.FileFormat == "" {
+		return errs.Precondition(errs.ConfigInvalid, codeFileFormatMissing,
+			fmt.Errorf("file_format is required (%v)", supportedFileFormats))
+	}
+
+	validFormat := false
+	for _, format := range supportedFileFormats {
+		if c.FileFormat == format {
+			validFormat = true
+			break
+		}
+	}
+	if !validFormat {
+		return errs.Precondition(errs.ConfigInvalid, codeUnsupportedFileFormat,
+			fmt.Errorf("invalid file_format: must be %v", supportedFileFormats))
+	}
+
+	// Set default values
+	if c.Compression == "" {
+		c.Compression = CompressionNone
+	}
+
+	// Validate compression type
+	validCompression := false
+	for _, compression := range []CompressionType{CompressionNone, CompressionGzip, CompressionZip} {
+		if c.Compression == compression {
+			validCompression = true
+			break
+		}
+	}
+	if !validCompression {
+		return errs.Precondition(errs.ConfigInvalid, codeCompressionInvalid,
+			fmt.Errorf("invalid compression: must be none, gzip, or zip"))
+	}
+
+	// Format-specific validation and defaults
+	if c.FileFormat == FormatCSV && c.CSV == nil {
+		// Initialize with defaults if not provided
+		c.CSV = &parser.CSVConfig{
+			Delimiter:      ",",
+			HasHeader:      true,
+			SkipRows:       0,
+			QuoteCharacter: "\"",
+		}
+	}
+
+	if c.FileFormat == FormatJSON && c.JSON == nil {
+		// Initialize with defaults if not provided
+		c.JSON = &parser.JSONConfig{
+			LineDelimited: true,
+		}
+	}
+
+	if c.FileFormat == FormatParquet && c.Parquet == nil {
+		// Initialize with defaults if not provided
+		c.Parquet = &parser.ParquetConfig{
+			StreamingEnabled: true,
+		}
+	}
+
+	if c.FileFormat == FormatXML && c.XML == nil {
+		c.XML = &parser.XMLConfig{}
+	}
+	if err := utils.ApplyMaxThreadsDefault(&c.MaxThreads); err != nil {
+		return err
+	}
+
+	if err := utils.ApplyRetryCountDefault(&c.RetryCount); err != nil {
+		return err
+	}
+
+	// Normalize path prefix (remove leading/trailing slashes)
+	if c.PathPrefix != "" {
+		c.PathPrefix = strings.Trim(c.PathPrefix, "/")
+	}
+
+	return nil
+}
+
+// FileObject represents a file object in S3
+type FileObject struct {
+	FileKey      string `json:"file_key"`
+	Size         int64  `json:"size"`
+	LastModified string `json:"last_modified"`
+	ETag         string `json:"etag"`
+}
+
+// GetCSVConfig returns the CSV parser configuration
+func (c *Config) GetCSVConfig() *parser.CSVConfig {
+	return c.CSV
+}
+
+// GetJSONConfig returns the JSON parser configuration
+func (c *Config) GetJSONConfig() *parser.JSONConfig {
+	return c.JSON
+}
+
+// GetParquetConfig returns the Parquet parser configuration
+func (c *Config) GetParquetConfig() *parser.ParquetConfig {
+	return c.Parquet
+}
+
+func (c *Config) GetXMLConfig() *parser.XMLConfig {
+	return c.XML
+}

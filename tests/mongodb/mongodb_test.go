@@ -1,0 +1,102 @@
+package mongodb
+
+import (
+	"testing"
+
+	"github.com/datazip-inc/olake/tests/testutils"
+	"github.com/datazip-inc/olake/tests/testutils/compatibility"
+	"github.com/datazip-inc/olake/tests/testutils/constants"
+	"github.com/datazip-inc/olake/tests/testutils/integration"
+	"github.com/datazip-inc/olake/tests/testutils/performance"
+	"github.com/datazip-inc/olake/tests/testutils/require"
+)
+
+// mongodbTestConfig builds the config every mongodb suite shares: the source, the namespace and the stream settings.
+func mongodbTestConfig(t *testing.T, opts ...testutils.TestConfigOption) *testutils.TestConfig {
+	cfg, err := testutils.NewTestConfig(t, constants.MongoDB, "olake_mongodb_test", ExecuteQuery, opts...)
+	require.NoError(t, err, "failed to build the test config")
+	cfg.CursorField = "id_cursor:id_int"
+	cfg.PartitionRegex = "/{_id,identity}"
+	cfg.ColumnToExclude = "excludedColumn"
+	cfg.SkipSchemaEvolution = true
+	cfg.FilterConfig = `{
+			"logical_operator": "And",
+			"conditions": [
+				{
+					"column": "id_double",
+					"operator": "<",
+					"value": 239834.89
+				},
+				{
+					"column": "id_timestamp",
+					"operator": ">=",
+					"value": "2022-07-01T15:30:00.000+00:00"
+				}
+			]
+		}`
+
+	return cfg
+}
+
+// mongodbBaseConfig is mongodbTestConfig with the integration suites' expected data.
+func mongodbBaseConfig(t *testing.T, opts ...testutils.TestConfigOption) *integration.TestHandler {
+	return &integration.TestHandler{
+		TestConfig:                mongodbTestConfig(t, opts...),
+		ExpectedData:              ExpectedMongoData,
+		DestinationDataTypeSchema: MongoToDestinationSchema,
+		TypeMapping:               MongoTypeMapping(),
+		ParquetTypeMapping:        MongoParquetTypeMapping(),
+		DefaultCDCColumnsSchema:   ExpectedMongoDBDefaultCDCColumnsSchema,
+	}
+}
+
+func TestMongodbDiscover(t *testing.T) {
+	mongodbBaseConfig(t).TestDiscover(t)
+}
+
+// mongodbSyncConfig adds to mongodbBaseConfig what the sync suites verify after the update sync.
+func mongodbSyncConfig(t *testing.T, opts ...testutils.TestConfigOption) *integration.TestHandler {
+	cfg := mongodbBaseConfig(t, opts...)
+	cfg.ExpectedUpdatedData = ExpectedUpdatedData
+	cfg.UpdatedDestinationDataTypeSchema = UpdatedMongoToDestinationSchema
+	return cfg
+}
+
+func TestMongodbSync(t *testing.T) {
+	t.Parallel()
+	mongodbSyncConfig(t).TestSync(t)
+}
+
+func TestMongodb2PC(t *testing.T) {
+	t.Parallel()
+	mongodbBaseConfig(t).Test2PCIntegration(t)
+}
+
+func TestMongodbPerformance(t *testing.T) {
+	cfg, err := testutils.NewTestConfig(t, constants.MongoDB, "twitter_data", ExecuteQuery)
+	require.NoError(t, err, "failed to build the test config")
+
+	perf := &performance.TestHandler{
+		TestConfig:      cfg,
+		BackfillStreams: performance.GetBackfillStreamsFromCDC(performanceCDCStreams),
+		CDCStreams:      performanceCDCStreams,
+	}
+
+	perf.TestPerformance(t)
+}
+
+// TestMongodbCompatibility pins the backward-compatibility contract for the driver owning the v5 gate
+// (BSON DateTime decoded as UTC time.Time at any depth, constants/state_version.go). v0.6.1 is
+// the newest release still on state version 4, so it is the one that exercises it.
+func TestMongodbCompatibility(t *testing.T) {
+	t.Parallel()
+	testHandler := &compatibility.TestHandler{
+		NewConfig: func(t *testing.T, version string) *testutils.TestConfig {
+			return mongodbTestConfig(t, testutils.WithDriverVersion(version))
+		},
+		DestinationSchema: MongoToDestinationSchema,
+		ColumnTypes:       seedColumnTypes(),
+		CDCColumnsSchema:  ExpectedMongoDBDefaultCDCColumnsSchema,
+	}
+	testHandler.RunBackwardCompatibility(t)
+}

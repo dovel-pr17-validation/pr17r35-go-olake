@@ -1,0 +1,362 @@
+package driver
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	mssql "github.com/microsoft/go-mssqldb"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/pkg/jdbc"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
+	"github.com/jmoiron/sqlx"
+	"golang.org/x/crypto/ssh"
+)
+
+type MSSQL struct {
+	client        *sqlx.DB
+	config        *Config
+	state         *types.State
+	lsnMap        sync.Map
+	streams       []types.StreamInterface
+	cdcSupported  bool
+	isReadReplica bool
+	sshClient     *ssh.Client
+	primaryClient *sqlx.DB
+	// prerequisites holds the CDC setup checks evaluated in Setup; when the config selects CDC,
+	// unmet required checks fail Setup via abstract.RequireCDCPrerequisites.
+	prerequisites types.PrerequisiteResults
+}
+
+// GetConfigRef implements abstract.DriverInterface.
+func (m *MSSQL) GetConfigRef() abstract.Config {
+	m.config = &Config{}
+	return m.config
+}
+
+// Spec implements abstract.DriverInterface.
+func (m *MSSQL) Spec() any {
+	return Config{}
+}
+
+// Type implements abstract.DriverInterface.
+func (m *MSSQL) Type() string {
+	return string(constants.MSSQL)
+}
+
+func (m *MSSQL) CDCSupported() bool {
+	return m.cdcSupported
+}
+
+// Setup establishes the database connection and initializes CDC settings.
+func (m *MSSQL) Setup(ctx context.Context) error {
+	if err := m.config.Validate(); err != nil {
+		return fmt.Errorf("failed to validate config: %w", err)
+	}
+
+	var err error
+	if m.config.SSHConfig != nil && m.config.SSHConfig.Host != "" {
+		m.sshClient, err = setupSSH(m.config.SSHConfig)
+		if err != nil {
+			return fmt.Errorf("failed to setup SSH connection: %w", err)
+		}
+		logger.Info("Connecting to MSSQL via SSH tunnel")
+	}
+
+	m.client, err = setupDBConnection(ctx, m.config.URI(), m.sshClient, m.config.Host, m.config.MaxThreads)
+	if err != nil {
+		return fmt.Errorf("failed to connect to MSSQL: %w", err)
+	}
+
+	m.isReadReplica = m.detectReadReplica(ctx)
+	if m.isReadReplica {
+		logger.Info("Connected to a read-only MSSQL replica; agent catch-up wait will be skipped")
+	}
+
+	if m.config.ManageCaptureInstances && m.config.PrimaryConfig != nil && m.config.PrimaryConfig.Host != "" {
+		m.primaryClient, err = setupDBConnection(
+			ctx,
+			m.config.primaryURI(),
+			m.sshClient,
+			m.config.PrimaryConfig.Host,
+			1,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to connect to primary for capture instance management: %w", err)
+		}
+		logger.Info("connected to primary node successfully for capture instance management")
+	}
+
+	var cdcSelected bool
+	switch utils.UpdateMethodType(m.config.UpdateMethod) {
+	case constants.UpdateMethodStandalone:
+		logger.Info("Standard Replication is selected")
+		return nil
+	case constants.UpdateMethodCDC:
+		logger.Info("Found CDC Configuration")
+		cdcSelected = true
+	default:
+		// Config predates update_method: CDC stays available, and the prerequisites are
+		// reported without blocking anything (legacy sources must keep syncing).
+		logger.Info("No update method configured, keeping CDC available for this source")
+	}
+	// needs isReadReplica and primaryClient, both set above
+	m.prerequisites = abstract.RunPrerequisites(ctx, m.prerequisiteChecks(cdcSelected))
+	if cdcSelected {
+		// The config selects CDC, so an unmet requirement fails the connection test rather than
+		// leaving a source that cannot sync.
+		if err := abstract.RequireCDCPrerequisites(m.Type(), m.prerequisites); err != nil {
+			return err
+		}
+	}
+	// Reached once the required checks pass (CDC selected), or for a legacy config whose checks
+	// are advisory. Legacy sources keep CDC only when the database has it enabled, so discovery
+	// defaults to incremental instead of a CDC mode that would fail in PreCDC.
+	m.cdcSupported = cdcSelected || legacyCDCSupported(m.prerequisites)
+	return nil
+}
+
+// detectReadReplica reports whether this connection targets a read-only
+// secondary replica. If detection fails, it logs a warning and returns false
+// so the driver still behaves as on a primary.
+func (m *MSSQL) detectReadReplica(ctx context.Context) bool {
+	var isReadReplica bool
+	err := m.client.QueryRowContext(ctx, jdbc.MSSQLIsReadReplicaQuery()).Scan(&isReadReplica)
+	if err != nil {
+		logger.Warnf("could not determine read replica status - assuming primary: %s", err)
+		return false
+	}
+	return isReadReplica
+}
+
+// Close ensures proper cleanup
+func (m *MSSQL) Close() error {
+	if m.client != nil {
+		err := m.client.Close()
+		if err != nil {
+			logger.Errorf("failed to close connection with MSSQL: %s", err)
+		}
+	}
+
+	if m.primaryClient != nil {
+		if err := m.primaryClient.Close(); err != nil {
+			logger.Errorf("failed to close primary MSSQL connection: %s", err)
+		}
+	}
+
+	if m.sshClient != nil {
+		if err := m.sshClient.Close(); err != nil {
+			logger.Errorf("failed to close SSH client: %s", err)
+		}
+	}
+
+	return nil
+}
+
+func setupSSH(sshCfg *utils.SSHConfig) (*ssh.Client, error) {
+	sshClient, err := sshCfg.SetupSSHConnection()
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("established SSH tunnel connection successfully")
+	return sshClient, nil
+}
+
+func setupDBConnection(ctx context.Context, uri string, sshClient *ssh.Client, host string, maxConns int) (*sqlx.DB, error) {
+	connector, err := mssql.NewConnector(uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MSSQL connector: %w", err)
+	}
+	if sshClient != nil {
+		connector.Dialer = &mssqlSSHDialer{sshClient: sshClient, host: host}
+	}
+
+	client := sqlx.NewDb(sql.OpenDB(connector), "sqlserver")
+	client.SetMaxOpenConns(maxConns)
+
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := client.PingContext(pingCtx); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return client, nil
+}
+
+type mssqlSSHDialer struct {
+	sshClient *ssh.Client
+	host      string
+}
+
+func (d *mssqlSSHDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return d.sshClient.DialContext(ctx, network, addr)
+}
+
+// HostName implements go-mssqldb's HostDialer interface, signaling that DNS
+// resolution should happen on the remote (SSH) side rather than locally.
+func (d *mssqlSSHDialer) HostName() string {
+	return d.host
+}
+
+// SetupState wires global state reference.
+func (m *MSSQL) SetupState(state *types.State) {
+	m.state = state
+}
+
+func (m *MSSQL) MaxConnections() int {
+	return m.config.MaxThreads
+}
+
+func (m *MSSQL) MaxRetries() int {
+	return m.config.RetryCount
+}
+
+func (m *MSSQL) GetStreamNames(ctx context.Context) ([]types.StreamID, error) {
+	logger.Infof("Starting discover for MSSQL database %s", m.config.Database)
+
+	query := jdbc.MSSQLDiscoverTablesQuery()
+	rows, err := m.client.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tables: %w", err)
+	}
+	defer rows.Close()
+
+	var tableNames []types.StreamID
+	for rows.Next() {
+		var tableName, schemaName string
+		if err := rows.Scan(&schemaName, &tableName); err != nil {
+			return nil, fmt.Errorf("failed to scan table: %w", err)
+		}
+		tableNames = append(tableNames, types.StreamID{Namespace: schemaName, Name: tableName})
+	}
+
+	// Check for any errors that occurred while iterating over the rows
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tableNames, nil
+}
+
+func (m *MSSQL) ProduceSchema(ctx context.Context, streamName types.StreamID) (*types.Stream, error) {
+	produceTableSchema := func(ctx context.Context, streamName types.StreamID) (*types.Stream, error) {
+		logger.Infof("producing type schema for stream [%s]", streamName)
+		schemaName, tableName := streamName.Namespace, streamName.Name
+		stream := types.NewStream(tableName, schemaName, &m.config.Database)
+
+		columnQuery := jdbc.MSSQLTableSchemaQuery()
+		rows, err := m.client.QueryContext(ctx, columnQuery, schemaName, tableName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query column information: %w", err)
+		}
+		defer rows.Close()
+
+		type columnInfo struct {
+			name         string
+			dataType     string
+			isNullable   string
+			isPrimaryKey bool
+		}
+
+		var columns []columnInfo
+		for rows.Next() {
+			var colInfo columnInfo
+			if err := rows.Scan(&colInfo.name, &colInfo.dataType, &colInfo.isNullable, &colInfo.isPrimaryKey); err != nil {
+				return nil, fmt.Errorf("failed to scan column: %w", err)
+			}
+			columns = append(columns, colInfo)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+
+		for _, column := range columns {
+			stream.WithCursorField(column.name)
+
+			var datatype types.DataType
+			if val, found := mssqlTypeToDataTypes[strings.ToLower(column.dataType)]; found {
+				datatype = val
+			} else {
+				logger.Warnf("Unsupported MSSQL type '%s' for column '%s.%s', defaulting to String", column.dataType, streamName, column.name)
+				datatype = types.String
+			}
+			stream.UpsertField(column.name, datatype, strings.EqualFold(column.isNullable, "YES"), false)
+
+			if column.isPrimaryKey {
+				stream.WithPrimaryKey(column.name)
+			}
+		}
+
+		return stream, nil
+	}
+	stream, err := produceTableSchema(ctx, streamName)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("failed to produce schema context deadline exceeded: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("failed to process table[%s]: %w", streamName, err)
+	}
+
+	stream.WithSyncMode(types.FULLREFRESH, types.INCREMENTAL)
+	if m.CDCSupported() {
+		stream.UpsertField(CDCStartLSN, types.String, true, true)
+		stream.UpsertField(CDCSeqVal, types.String, true, true)
+		stream.WithSyncMode(types.CDC, types.STRICTCDC)
+	}
+
+	return stream, nil
+}
+
+func (m *MSSQL) dataTypeConverter(value interface{}, columnType string) (interface{}, error) {
+	if value == nil {
+		return nil, typeutils.ErrNullValue
+	}
+
+	columnType = strings.ToLower(columnType)
+	switch columnType {
+	// SQL Server stores UNIQUEIDENTIFIER values in a mixed-endian binary format:
+	// the first three fields are little-endian, while the remaining bytes are big-endian.
+	// When the driver returns this value as []byte, we must reorder the bytes to
+	// reconstruct a proper RFC4122 UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+	case "uniqueidentifier":
+		if v, ok := value.([]byte); ok {
+			if uuid, converted := formatUniqueIdentifierBytes(v); converted {
+				return uuid, nil
+			}
+		}
+		return fmt.Sprintf("%s", value), nil
+	// TODO: check how to handle hierarchyid datatype
+	case "hierarchyid":
+		if val, ok := value.(string); ok {
+			return val, nil
+		}
+		// Note: This returns a hex representation, not the hierarchical path format
+		// For proper "/1/2/3/" format, cast in SQL using col.ToString()
+		return fmt.Sprintf("%x", value), nil
+	case "time":
+		return typeutils.ReformatTimeValue(value)
+	}
+
+	olakeType := typeutils.ExtractAndMapColumnType(columnType, mssqlTypeToDataTypes)
+	return typeutils.ReformatValue(olakeType, value)
+}
+
+func (m *MSSQL) isDatabaseCDCEnabled(ctx context.Context) (bool, error) {
+	// sys.databases.is_cdc_enabled is a BIT; go-mssqldb returns it as bool.
+	var isEnabled bool
+	err := m.client.QueryRowContext(ctx, jdbc.MSSQLCDCSupportQuery()).Scan(&isEnabled)
+	if err != nil {
+		return false, fmt.Errorf("failed to check MSSQL CDC enablement: %w", err)
+	}
+
+	return isEnabled, nil
+}

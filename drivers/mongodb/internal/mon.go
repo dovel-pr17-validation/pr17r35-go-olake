@@ -1,0 +1,380 @@
+package driver
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"net"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsoncodec"
+	"go.mongodb.org/mongo-driver/bson/bsonrw"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/ssh"
+)
+
+// safeDecodeRegistry is a BSON decode registry registered on the MongoDB client.
+// It intercepts two problem cases for interface{} slots (every value in bson.M):
+//
+//  1. BSON Double (float64) — NaN and ±Inf are not valid JSON; they crash
+//     encoding/json.  These are coerced to nil for all state versions.
+//
+//  2. BSON DateTime — primitive.DateTime.MarshalJSON calls time.Time.MarshalJSON
+//     which panics for years outside [0, 9999].  For state version > 4, DateTime
+//     is decoded as a clamped UTC time.Time so downstream json.Marshal is always
+//     safe.  For state version ≤ 4 the fallback (primitive.DateTime) is used to
+//     preserve the pre-existing local-timezone output format.
+var safeDecodeRegistry = func() *bsoncodec.Registry {
+	tEmpty := reflect.TypeOf((*interface{})(nil)).Elem()
+	reg := bson.NewRegistry()
+	// Capture the stock interface{} decoder before replacing it.
+	fallback, _ := reg.LookupDecoder(tEmpty)
+	reg.RegisterTypeDecoder(
+		tEmpty,
+		bsoncodec.ValueDecoderFunc(func(dc bsoncodec.DecodeContext, vr bsonrw.ValueReader, val reflect.Value) error {
+			switch vr.Type() {
+			case bson.TypeDouble:
+				f, err := vr.ReadDouble()
+				if err != nil {
+					return err
+				}
+				if math.IsNaN(f) || math.IsInf(f, 0) {
+					val.Set(reflect.Zero(val.Type()))
+				} else {
+					val.Set(reflect.ValueOf(f))
+				}
+				return nil
+			case bson.TypeDateTime:
+				if constants.LoadedStateVersion > 4 {
+					ms, err := vr.ReadDateTime()
+					if err != nil {
+						return err
+					}
+					t, err := typeutils.ReformatDate(primitive.DateTime(ms).Time().UTC(), true)
+					if err != nil {
+						return err
+					}
+					val.Set(reflect.ValueOf(t))
+					return nil
+				}
+			}
+			return fallback.DecodeValue(dc, vr, val)
+		}),
+	)
+	return reg
+}()
+
+const (
+	cdcCursorField = "_data"
+)
+
+type Mongo struct {
+	config     *Config
+	client     *mongo.Client
+	CDCSupport bool // indicates if the MongoDB instance supports Change Streams
+	cdcCursor  sync.Map
+	state      *types.State // reference to globally present state
+	streams    []types.StreamInterface
+	sshDialer  *MongoSSHDialer
+	// prerequisites holds the CDC setup checks evaluated in Setup; when the config selects CDC,
+	// unmet required checks fail Setup via abstract.RequireCDCPrerequisites.
+	prerequisites types.PrerequisiteResults
+}
+
+// MongoSSHDialer implements a custom dialer for SSH tunnel connections.
+// The MongoDB Go driver doesn't support SSH tunneling natively, so we
+// implement the Dialer interface to route connections through SSH tunnels
+// for secure access to databases behind bastion hosts.
+type MongoSSHDialer struct {
+	sshClient *ssh.Client
+}
+
+func (d *MongoSSHDialer) DialContext(ctx context.Context, _, address string) (net.Conn, error) {
+	if d.sshClient == nil {
+		return nil, fmt.Errorf("SSH client is not initialized")
+	}
+	conn, err := d.sshClient.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	return utils.ConnWithCustomDeadlineSupport(conn)
+}
+
+// config reference; must be pointer
+func (m *Mongo) GetConfigRef() abstract.Config {
+	m.config = &Config{}
+	return m.config
+}
+
+func (m *Mongo) Spec() any {
+	return Config{}
+}
+
+func (m *Mongo) CDCSupported() bool {
+	return m.CDCSupport
+}
+
+func (m *Mongo) Setup(ctx context.Context) error {
+	if err := m.config.Validate(); err != nil {
+		return fmt.Errorf("failed to validate config: %w", err)
+	}
+
+	if m.config.SSHConfig != nil && m.config.SSHConfig.Host != "" {
+		logger.Info("Found SSH Configuration")
+		sshClient, err := m.config.SSHConfig.SetupSSHConnection()
+		if err != nil {
+			return fmt.Errorf("failed to setup SSH connection: %w", err)
+		}
+		m.sshDialer = &MongoSSHDialer{sshClient: sshClient}
+	}
+
+	opts := options.Client()
+
+	opts.ApplyURI(m.config.URI())
+	tlsConfig, err := m.config.buildTLSConfig()
+	if err != nil {
+		return fmt.Errorf("failed to build tls config: %w", err)
+	}
+	if tlsConfig != nil {
+		opts.SetTLSConfig(tlsConfig)
+	}
+	opts.SetCompressors([]string{"snappy"}) // using Snappy compression; read here https://en.wikipedia.org/wiki/Snappy_(compression)
+	opts.SetRegistry(safeDecodeRegistry)
+	if m.sshDialer != nil {
+		opts.SetDialer(m.sshDialer)
+	}
+	if maxPoolSize := m.config.MaxThreads; maxPoolSize > 0 {
+		opts.SetMaxPoolSize(uint64(maxPoolSize))
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	conn, err := mongo.Connect(connectCtx, opts)
+	if err != nil {
+		return err
+	}
+
+	// Validate the connection by pinging the database
+	if err := conn.Ping(connectCtx, nil); err != nil {
+		return fmt.Errorf("failed to connect to MongoDB: %w", err)
+	}
+
+	m.client = conn
+
+	if err := m.setupCDC(ctx); err != nil {
+		return err
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	return m.client.Ping(pingCtx, options.Client().ReadPreference)
+}
+
+// setupCDC evaluates the change-stream prerequisites and records whether CDC can run.
+func (m *Mongo) setupCDC(ctx context.Context) error {
+	var cdcSelected bool
+	switch utils.UpdateMethodType(m.config.UpdateMethod) {
+	case constants.UpdateMethodStandalone:
+		logger.Info("Standard Replication is selected")
+		return nil
+	case constants.UpdateMethodCDC:
+		logger.Info("Found CDC Configuration")
+		cdcSelected = true
+	default:
+		// Config predates update_method: change streams stay available, and the prerequisites
+		// are reported without blocking anything (legacy sources must keep syncing).
+		logger.Info("No update method configured, keeping change streams available for this source")
+	}
+
+	m.prerequisites = abstract.RunPrerequisites(ctx, m.prerequisiteChecks(cdcSelected))
+	if cdcSelected {
+		// The config selects CDC, so an unmet requirement fails the connection test rather than
+		// leaving a source that cannot sync.
+		if err := abstract.RequireCDCPrerequisites(m.Type(), m.prerequisites); err != nil {
+			return err
+		}
+	}
+	// Reached only once the required checks pass, or for a legacy config whose checks are
+	// advisory: those sources kept change streams before update_method existed.
+	m.CDCSupport = true
+	return nil
+}
+
+func (m *Mongo) Close(ctx context.Context) error {
+	if m.client != nil {
+		if err := m.client.Disconnect(ctx); err != nil {
+			logger.Errorf("failed to disconnect from MongoDB: %s", err)
+		}
+	}
+
+	if m.sshDialer != nil && m.sshDialer.sshClient != nil {
+		if err := m.sshDialer.sshClient.Close(); err != nil {
+			logger.Errorf("failed to close SSH client: %s", err)
+		}
+	}
+
+	return nil
+}
+
+func (m *Mongo) Type() string {
+	return string(constants.MongoDB)
+}
+
+func (m *Mongo) SetupState(state *types.State) {
+	m.state = state
+}
+
+func (m *Mongo) MaxConnections() int {
+	return m.config.MaxThreads
+}
+
+func (m *Mongo) MaxRetries() int {
+	return m.config.RetryCount
+}
+
+func (m *Mongo) GetStreamNames(ctx context.Context) ([]types.StreamID, error) {
+	logger.Infof("Starting discover for MongoDB database %s", m.config.Database)
+	database := m.client.Database(m.config.Database)
+	collections, err := database.ListCollections(ctx, bson.M{})
+	if err != nil {
+		return nil, err
+	}
+
+	var streamNames []types.StreamID
+	// Iterate through collections and check if they are views
+	for collections.Next(ctx) {
+		var collectionInfo bson.M
+		if err := collections.Decode(&collectionInfo); err != nil {
+			return nil, fmt.Errorf("failed to decode collection: %w", err)
+		}
+
+		// Skip if collection is a view
+		if collectionType, ok := collectionInfo["type"].(string); ok && collectionType == "view" {
+			continue
+		}
+
+		// Skip if collection is system.*
+		if name, ok := collectionInfo["name"].(string); ok && strings.HasPrefix(name, "system.") {
+			continue
+		}
+
+		streamNames = append(streamNames, types.StreamID{Namespace: m.config.Database, Name: collectionInfo["name"].(string)})
+	}
+	return streamNames, collections.Err()
+}
+
+// discover samples collections in buckets through ProduceSampledSchema
+var _ abstract.SampledSchemaProducer = (*Mongo)(nil)
+
+func (m *Mongo) ProduceSchema(ctx context.Context, streamID types.StreamID) (*types.Stream, error) {
+	buckets := abstract.DiscoverSampleBuckets
+	return m.ProduceSampledSchema(ctx, streamID, buckets[len(buckets)-1])
+}
+
+// TODO: Add support for time series mongodb collections
+// ProduceSampledSchema builds the collection's schema from its first and last limit documents in
+// natural order.
+func (m *Mongo) ProduceSampledSchema(ctx context.Context, streamID types.StreamID, limit int) (*types.Stream, error) {
+	produceCollectionSchema := func(ctx context.Context, db *mongo.Database, streamName string) (*types.Stream, error) {
+		logger.Infof("producing type schema for stream [%s] from %d documents", streamName, limit)
+
+		// initialize stream
+		collection := db.Collection(streamName)
+		stream := types.NewStream(streamName, streamID.Namespace, nil)
+		// _id is the guaranteed unique, mandatory field in every MongoDB collection.
+		stream.WithPrimaryKey(constants.MongoPrimaryID)
+
+		// Define find options for fetching documents in ascending and descending order.
+		findOpts := []*options.FindOptions{
+			options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "$natural", Value: 1}}),
+			options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "$natural", Value: -1}}),
+		}
+
+		return stream, utils.Concurrent(ctx, findOpts, len(findOpts), func(ctx context.Context, findOpt *options.FindOptions, _ int) error {
+			cursor, err := collection.Find(ctx, bson.D{}, findOpt)
+			if err != nil {
+				return err
+			}
+			defer cursor.Close(ctx)
+
+			for cursor.Next(ctx) {
+				var row bson.M
+				if err := cursor.Decode(&row); err != nil {
+					return err
+				}
+
+				filterMongoObject(row)
+				if err := typeutils.Resolve(stream, row); err != nil {
+					return err
+				}
+			}
+
+			return cursor.Err()
+		})
+	}
+	database := m.client.Database(m.config.Database)
+	// Either wait for covering limit records from both sides for all streams
+	// Or wait till discoverCtx exits
+	stream, err := produceCollectionSchema(ctx, database, streamID.Name)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("failed to produce schema context deadline exceeded: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("failed to process collection[%s]: %w", streamID.Name, err)
+	}
+	// Add all discovered fields as potential cursor fields
+	stream.Schema.Properties.Range(func(key, _ interface{}) bool {
+		if fieldName, ok := key.(string); ok {
+			stream.WithCursorField(fieldName)
+		}
+		return true
+	})
+
+	stream.WithSyncMode(types.FULLREFRESH, types.INCREMENTAL)
+	if m.CDCSupported() {
+		stream.UpsertField(CDCResumeToken, types.String, true, true)
+		stream.WithSyncMode(types.CDC, types.STRICTCDC)
+	}
+
+	return stream, nil
+}
+
+func filterMongoObject(doc bson.M) {
+	for key, value := range doc {
+		// first make key small case as data being typeresolved with small case keys
+		delete(doc, key)
+		switch value := value.(type) {
+		case primitive.Timestamp:
+			doc[key] = value.T
+		case primitive.DateTime:
+			t := value.Time()
+			var err error
+			doc[key], err = typeutils.ReformatDate(t, true)
+			if err != nil {
+				doc[key] = time.Unix(0, 0).UTC()
+			}
+		case primitive.Null:
+			doc[key] = nil
+		case primitive.Binary:
+			doc[key] = fmt.Sprintf("%x", value.Data)
+		case primitive.Decimal128:
+			doc[key] = value.String()
+		case primitive.ObjectID:
+			doc[key] = value.Hex()
+		default:
+			doc[key] = value
+		}
+	}
+}
